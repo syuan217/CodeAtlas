@@ -1,0 +1,187 @@
+"""atlas CLI 入口(typer)。M0:doctor / status / cost。"""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+import time
+
+import typer
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+from codeatlas import __version__
+from codeatlas.config import (
+    DB_PATH,
+    LANCEDB_DIR,
+    REPOS_YAML,
+    ensure_dirs,
+    get_settings,
+    load_repos,
+)
+from codeatlas.cost import cost_summary, model_summary, total_cost
+from codeatlas.db.models import connect, init_db
+from codeatlas.providers._retry import CostLimitExceeded, ProviderError
+from codeatlas.providers.embedding import EmbeddingProvider, unpack_vector
+from codeatlas.providers.llm import LLMProvider
+
+app = typer.Typer(help="codeatlas · 本地代码知识库", no_args_is_help=True)
+console = Console()
+
+
+@app.command()
+def status() -> None:
+    """库状态:schema 版本、repos、各类对象计数、数据目录。"""
+    ensure_dirs()
+    conn = connect()
+    try:
+        init_db(conn)
+        repos = conn.execute("SELECT COUNT(*) AS c FROM repos").fetchone()["c"]
+        counts = {}
+        for table in ("files", "symbols", "edges", "chunks"):
+            counts[table] = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
+        schema_version = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()["value"]
+
+        table_out = Table(title="codeatlas status", show_header=False)
+        table_out.add_column(style="bold cyan")
+        table_out.add_column()
+        table_out.add_row("数据库", str(DB_PATH))
+        table_out.add_row("schema_version", schema_version)
+        table_out.add_row("repos(已注册)", str(repos))
+        for k, v in counts.items():
+            table_out.add_row(k, str(v))
+        table_out.add_row("向量库目录", str(LANCEDB_DIR))
+        table_out.add_row("仓库清单", str(REPOS_YAML) + f"({len(load_repos())} 条)")
+        table_out.add_row("累计费用", f"{total_cost(conn):.4f} 元")
+        console.print(table_out)
+
+        repo_rows = conn.execute(
+            "SELECT name, indexed_commit, last_indexed_at FROM repos ORDER BY id"
+        ).fetchall()
+        if repo_rows:
+            rt = Table(title="repos")
+            for col in ("name", "indexed_commit", "last_indexed_at"):
+                rt.add_column(col)
+            for r in repo_rows:
+                rt.add_row(r["name"], r["indexed_commit"] or "-", r["last_indexed_at"] or "-")
+            console.print(rt)
+    finally:
+        conn.close()
+
+
+@app.command()
+def cost(
+    by_model: bool = typer.Option(False, "--by-model", help="按模型而非 stage 汇总"),
+) -> None:
+    """费用统计(usage_log 汇总)。"""
+    conn = connect()
+    try:
+        init_db(conn)
+        rows = model_summary(conn) if by_model else cost_summary(conn)
+        t = Table(title="费用统计")
+        key = "model" if by_model else "stage"
+        for col in (key, "calls", "prompt_tokens", "completion_tokens", "cost(元)"):
+            t.add_column(col, justify="right" if col != key else "left")
+        for r in rows:
+            t.add_row(
+                r[key], str(r["calls"]), str(r["prompt_tokens"]),
+                str(r["completion_tokens"]), f"{r['cost']:.6f}",
+            )
+        console.print(t)
+        if not rows:
+            console.print("[dim]尚无费用流水(usage_log 为空)[/dim]")
+        else:
+            console.print(f"合计:{total_cost(conn):.6f} 元")
+    finally:
+        conn.close()
+
+
+async def _doctor() -> None:
+    s = get_settings()
+
+    env_table = Table(title="环境", show_header=False)
+    env_table.add_column(style="bold cyan")
+    env_table.add_column()
+    env_table.add_row("codeatlas", f"v{__version__}")
+    env_table.add_row("数据库", str(DB_PATH))
+    conn = connect()
+    init_db(conn)
+
+    llm_configured = bool(s.llm_base_url and s.llm_api_key and s.llm_model)
+    embed_configured = bool(s.embed_base_url and s.embed_api_key and s.embed_model)
+    if not (llm_configured and embed_configured):
+        env_table.add_row("LLM 配置", "[green]OK[/green]" if llm_configured else "[red]缺失[/red]")
+        env_table.add_row("Embedding 配置", "[green]OK[/green]" if embed_configured else "[red]缺失[/red]")
+        console.print(env_table)
+        console.print(
+            Panel(
+                "服务商未配置。请 `cp .env.example .env` 并填写 LLM/EMBED 三项"
+                "(BASE_URL / API_KEY / MODEL),再运行 atlas doctor。"
+            )
+        )
+        conn.close()
+        raise typer.Exit(code=1)
+
+    # ---- LLM 端点最小调用 ----
+    t0 = time.perf_counter()
+    llm = LLMProvider(s, conn)
+    try:
+        r = await llm.chat(
+            [{"role": "user", "content": "ping"}], stage="doctor", max_tokens=8
+        )
+        llm_ms = (time.perf_counter() - t0) * 1000
+        llm_line = (
+            f"[green]OK[/green]  模型 {r.model}  耗时 {llm_ms:.0f}ms  "
+            f"tokens {r.prompt_tokens}+{r.completion_tokens}  "
+            f"费用 {r.cost:.6f} 元" + ("" if r.priced else "  [yellow](单价未知,cost=0)[/yellow]")
+        )
+    except (ProviderError, CostLimitExceeded) as e:
+        llm_line = f"[red]FAIL[/red]  {e}"
+    finally:
+        await llm.aclose()
+
+    # ---- Embedding 端点最小调用 ----
+    t0 = time.perf_counter()
+    emb = EmbeddingProvider(s, conn)
+    try:
+        blobs = await emb.embed(["ping"], input_type="query", stage="doctor")
+        emb_ms = (time.perf_counter() - t0) * 1000
+        dim = len(blobs[0]) // 4
+        vec0 = unpack_vector(blobs[0])
+        finite = all(x == x and abs(x) != float("inf") for x in vec0)
+        emb_cost = conn.execute(
+            "SELECT COALESCE(SUM(cost),0) AS c FROM usage_log WHERE stage='doctor' AND model=?",
+            (s.embed_model,),
+        ).fetchone()["c"]
+        emb_line = (
+            f"[green]OK[/green]  模型 {s.embed_model}  维度 {dim}"
+            f"(EMBED_DIM={s.embed_dim} {'一致' if dim == s.embed_dim else '[red]不一致[/red]'})  "
+            f"耗时 {emb_ms:.0f}ms  数值 {'正常' if finite else '[red]含非有限值[/red]'}  "
+            f"累计费用 {emb_cost:.6f} 元"
+        )
+    except (ProviderError, CostLimitExceeded) as e:
+        emb_line = f"[red]FAIL[/red]  {e}"
+    finally:
+        await emb.aclose()
+
+    ok = llm_line.startswith("[green]") and emb_line.startswith("[green]")
+    env_table.add_row("LLM 端点", llm_line)
+    env_table.add_row("Embedding 端点", emb_line)
+    console.print(env_table)
+    console.print(f"本次 doctor 最小调用费用合计:{total_cost(conn):.6f} 元")
+    conn.close()
+    if not ok:
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def doctor() -> None:
+    """连通性体检:两个端点各一次最小调用,打印模型/维度/费用。"""
+    asyncio.run(_doctor())
+
+
+if __name__ == "__main__":
+    app()
