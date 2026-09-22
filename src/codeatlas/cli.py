@@ -218,6 +218,28 @@ def index(
 
 
 @app.command()
+def repair_vectors() -> None:
+    """一次性修复向量表:按 vector_refs + embed_cache 重写,消除重复/孤儿行。"""
+    conn = connect()
+    try:
+        init_db(conn)
+        s = get_settings()
+        from codeatlas.db.lance import LanceStore
+
+        store = LanceStore(s)
+        before = store.count()
+        rebuilt, missing = store.rebuild_from_sql(conn)
+        conn.commit()
+        store.maybe_create_index()
+        console.print(
+            f"向量表重建完成:{before} 行(含重复/孤儿)→ {rebuilt} 行有效;"
+            f"缺缓存向量 {missing} 条(下次 atlas index 会自动重嵌)"
+        )
+    finally:
+        conn.close()
+
+
+@app.command()
 def doctor() -> None:
     """连通性体检:两个端点各一次最小调用,打印模型/维度/费用。"""
     asyncio.run(_doctor())

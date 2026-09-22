@@ -50,6 +50,7 @@ class IndexStats:
     import_edges: int = 0
     chunks: int = 0
     embedded: int = 0
+    orphan_vectors_deleted: int = 0
     duration_s: float = 0.0
 
     def summary_line(self) -> str:
@@ -60,6 +61,7 @@ class IndexStats:
             f"{self.skipped_unknown_ext} failed={self.parse_failed} | "
             f"symbols={self.symbols} edges(C/I)={self.contains_edges}/{self.import_edges} "
             f"chunks={self.chunks} embedded={self.embedded} "
+            f"orphans-{self.orphan_vectors_deleted} "
             f"({self.duration_s:.1f}s)"
         )
 
@@ -284,6 +286,14 @@ def index_repo(
         conn.commit()
 
     lance.maybe_create_index()
+    # 向量对账:清理 Lance 中不属于任何现存 chunk 的孤儿(中断/重处理残留);
+    # 行数一致时零成本跳过
+    valid_ids = {
+        r["chunk_id"] for r in conn.execute("SELECT chunk_id FROM vector_refs")
+    }
+    stats.orphan_vectors_deleted = lance.reconcile_orphans(
+        valid_ids, expected_rows=len(valid_ids)
+    )
     stats.duration_s = time.time() - t0
     if own_conn:
         conn.close()

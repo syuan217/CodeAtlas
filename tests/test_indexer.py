@@ -384,3 +384,60 @@ def test_full_forces_reparse(env, tmp_path):
     after_ids = chunk_ids_by_file(env)
     assert all(before_ids[p] != after_ids[p] for p in before_ids)  # 全部重建
     assert env.count("vector_refs") == env.count("chunks")
+
+
+def test_add_vectors_idempotent_no_duplicates(env):
+    """同 chunk_id 重复写入不产生重复行(SQL id 复用场景的防御)。"""
+    store = env.lance()
+    rows = [(7, 1, "code", bytes([0]) * 16)]
+    store.add_vectors(rows)
+    store.add_vectors(rows)  # 同 id 再写:先清后写,不叠加
+    store.add_vectors([(8, 1, "code", bytes([1]) * 16)])
+    t = store.table
+    arrow = t.to_arrow()
+    ids = arrow.column("chunk_id").to_pylist()
+    assert sorted(ids) == [7, 8]
+    assert t.count_rows() == 2
+
+
+def test_rebuild_from_sql_dedupes(env):
+    """repair:按 vector_refs+embed_cache 重写后无重复无孤儿。"""
+    from codeatlas.config import content_hash
+
+    store = env.lance()
+    conn = env.conn
+    # 手工造脏数据:lance 三份同 id 行
+    blob = bytes([2]) * 16
+    store.add_vectors([(9, 1, "code", blob)])
+    t = store.table
+    t.add([{"id": "dup-1", "vector": [0.0] * 4, "chunk_id": 9, "repo_id": 1, "kind": "code"}])
+    t.add([{"id": "dup-2", "vector": [0.0] * 4, "chunk_id": 9, "repo_id": 1, "kind": "code"}])
+    assert t.count_rows() == 3
+    # SQL 侧:repo/file/chunk/vector_refs/embed_cache 各一条
+    conn.execute("INSERT INTO repos(name,path,languages) VALUES('r','/r','[]')")
+    repo_id = conn.execute("SELECT id FROM repos").fetchone()["id"]
+    conn.execute("INSERT INTO files(repo_id,path) VALUES(?, 'a.py')", (repo_id,))
+    file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+    conn.execute(
+        "INSERT INTO chunks(repo_id,file_id,kind,content,content_hash) "
+        "VALUES(?,?,'code','x',?)", (repo_id, file_id, content_hash("x")))
+    chunk_id = conn.execute("SELECT id FROM chunks").fetchone()["id"]
+    # 重建用 chunk_id=9 对齐上面的脏数据
+    conn.execute("UPDATE chunks SET id=9 WHERE id=?", (chunk_id,))
+    chunk_id = 9
+    conn.execute(
+        "INSERT INTO embed_cache(content_hash,model,dim,vector) VALUES(?,?,?,?)",
+        (content_hash("x"), "test-embed", 4, blob))
+    conn.execute(
+        "INSERT INTO vector_refs(chunk_id,lance_id,model) VALUES(?,?,?)",
+        (chunk_id, "old", "test-embed"))
+    conn.commit()
+
+    rebuilt, missing = store.rebuild_from_sql(conn)
+    conn.commit()
+    assert (rebuilt, missing) == (1, 0)
+    assert store.count() == 1
+    row = store.table.to_arrow()
+    assert row.column("chunk_id").to_pylist() == [9]
+    vr = conn.execute("SELECT lance_id FROM vector_refs WHERE chunk_id=9").fetchone()
+    assert vr["lance_id"] != "old"  # lance_id 已同步更新
