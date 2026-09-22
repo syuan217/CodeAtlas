@@ -110,8 +110,12 @@ class _Collector:
         parent: int | None,
         *,
         with_comment: bool = False,
+        line_override: int | None = None,
     ) -> int:
         sr, _, er, _ = _range(node)
+        if line_override is not None:
+            # Java 注解使节点起点落在注解行;行号/签名统一用签名行(验收 #27/#28/#33)
+            sr = line_override - 1
         sym = Symbol(
             kind=kind,
             name=name,
@@ -182,15 +186,19 @@ def _extract_java(
                             bindings.append(ImportBinding(parts[-1], fq, "class"))
                         break
             elif t in _JAVA_TYPES:
-                name = child.child_by_field_name("name").text.decode("utf-8")
+                name_node = child.child_by_field_name("name")
+                name = name_node.text.decode("utf-8")
                 qname = f"{prefix}{name}"
-                idx = col.add(child, _JAVA_TYPES[t], name, qname, parent, with_comment=True)
+                idx = col.add(child, _JAVA_TYPES[t], name, qname, parent,
+                              with_comment=True, line_override=name_node.start_point[0] + 1)
                 walk(child, f"{qname}.", idx)
             elif t == "method_declaration" or t == "constructor_declaration":
-                name = child.child_by_field_name("name").text.decode("utf-8")
+                name_node = child.child_by_field_name("name")
+                name = name_node.text.decode("utf-8")
                 kind = "method"
                 qname = f"{prefix.rstrip('.') or 'root'}#{name}"
-                col.add(child, kind, name, qname, parent)
+                col.add(child, kind, name, qname, parent,
+                        line_override=name_node.start_point[0] + 1)
             elif t in _JAVA_TRANSPARENT:
                 walk(child, prefix, parent)
 
@@ -238,9 +246,16 @@ def _extract_python(
                         part = part.strip()
                         if not part or part == "*":
                             continue
+                        original = part
                         if " as " in part:
+                            original = part.split(" as ")[0].strip()
                             part = part.split(" as ")[1].strip()
-                        bindings.append(ImportBinding(part, f"{level}{mod}", "named"))
+                        bindings.append(
+                            ImportBinding(
+                                part, f"{level}{mod}", "named",
+                                target_name=original if original != part else None,
+                            )
+                        )
             elif t == "import_statement":
                 m = _PY_IMPORT_RE.match(child.text.decode("utf-8"))
                 if m:
@@ -322,10 +337,12 @@ def _extract_ts(
                             if spec.type == "import_specifier":
                                 alias = spec.child_by_field_name("alias")
                                 name = spec.child_by_field_name("name")
-                                if alias is not None:
+                                if alias is not None and name is not None:
+                                    # import {原名 as 别名}:绑定别名,记忆原名
                                     bindings.append(
                                         ImportBinding(
-                                            alias.text.decode(), source, "named"
+                                            alias.text.decode(), source, "named",
+                                            target_name=name.text.decode(),
                                         )
                                     )
                                 elif name is not None:
@@ -624,6 +641,7 @@ def _calls_java(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
 def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
     sites: list[CallSite] = []
     caller_at = _caller_index(fs)
+    lex_names: set[str] = set()  # caller 词法域名字(参数/局部 const 与函数)
 
     def type_of_annotation(node) -> str | None:
         ann = node.child_by_field_name("type_annotation")
@@ -636,20 +654,23 @@ def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
             return None
         return _norm_type(ann.text.decode().lstrip(":").strip())
 
-    def walk(node, vars_: dict, caller: int | None):
+    def walk(node, vars_: dict, caller: int | None, lex: set[str]):
         for child in node.named_children:
             t = child.type
             if t in _TS_FUNCY or t == "method_definition":
                 sub = dict(vars_)
+                sub_lex = set(lex)  # 词法名字进入函数作用域副本
                 params = child.child_by_field_name("parameters")
                 if params is not None:
                     for p in params.named_children:
                         n = p.child_by_field_name("pattern")
+                        if n is not None:
+                            sub_lex.add(_ts_pattern_name(n))
                         ty = type_of_annotation(p)
                         if n is not None and ty:
                             sub[_ts_pattern_name(n)] = ty
                 idx = caller_at.get(child.start_point[0] + 1)
-                walk(child, sub, idx if idx is not None else caller)
+                walk(child, sub, idx if idx is not None else caller, sub_lex)
             elif t in ("class_declaration", "abstract_class_declaration"):
                 sub = dict(vars_)
                 for body in child.named_children:
@@ -660,7 +681,7 @@ def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
                                 ty = type_of_annotation(pd)
                                 if n is not None and ty:
                                     sub[n.text.decode()] = ty
-                walk(child, sub, caller)
+                walk(child, sub, caller, lex)
             elif t == "lexical_declaration":
                 for decl in child.named_children:
                     if decl.type != "variable_declarator":
@@ -668,6 +689,7 @@ def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
                     n = decl.child_by_field_name("name")
                     if n is None:
                         continue
+                    lex.add(_ts_pattern_name(n))
                     ty = type_of_annotation(decl)
                     val = decl.child_by_field_name("value")
                     if ty is None and val is not None and val.type == "new_expression":
@@ -676,7 +698,7 @@ def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
                             ty = _norm_type(ctor.text.decode())
                     if ty:
                         vars_[_ts_pattern_name(n)] = ty  # 原地传播到兄弟节点
-                walk(child, vars_, caller)
+                walk(child, vars_, caller, lex)
             elif t == "call_expression":
                 fn = child.child_by_field_name("function")
                 recv, name = _ts_call_target(fn)
@@ -690,8 +712,9 @@ def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
                         kind="call",
                         line=child.start_point[0] + 1,
                         col=child.start_point[1] + 1,
+                        local_def=(recv is None and name in lex),
                     ))
-                walk(child, vars_, caller)
+                walk(child, vars_, caller, lex)
             elif t == "new_expression":
                 ctor = child.child_by_field_name("constructor")
                 if ctor is not None:
@@ -705,9 +728,9 @@ def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
                         line=child.start_point[0] + 1,
                         col=child.start_point[1] + 1,
                     ))
-                walk(child, vars_, caller)
+                walk(child, vars_, caller, lex)
             else:
-                walk(child, vars_, caller)
+                walk(child, vars_, caller, lex)
 
     def _ts_call_target(fn):
         if fn is None:
@@ -734,7 +757,7 @@ def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
     def _ts_pattern_name(n) -> str:
         return n.text.decode()
 
-    walk(tree.root_node, {}, None)
+    walk(tree.root_node, {}, None, set())
     return sites
 
 

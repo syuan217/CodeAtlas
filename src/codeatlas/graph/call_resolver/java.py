@@ -45,6 +45,15 @@ def _same_file_exact(
 
 
 def resolve_site(site, caller: SymInfo | None, fs, ctx: ResolveContext) -> CascadeResult:
+    """M3 验收收紧后的级联(宁缺毋错):
+
+    - 裸/this/super 调用只认 类内 与 同文件,不再全库同名兜底
+      (跨类调用在 Java 必须类名限定,裸调用兜底必错);
+    - 带接收器且类型未知 → 丢弃(实例 getter/Lombok 生成方法/链式中间结果
+      均无类型可依,曾误绑同名 static 工具方法);
+    - new 只认库内类。
+    heuristic 兜底仅保留在 generic(python/go)。
+    """
     name, argc = site.name, site.arg_count
     file_rel = fs.rel
     caller_class = None
@@ -57,10 +66,7 @@ def resolve_site(site, caller: SymInfo | None, fs, ctx: ResolveContext) -> Casca
             r = _class_methods_exact(ctx, caller_class, name, argc)
             if r.resolved:
                 return r
-        r = _same_file_exact(ctx, file_rel, name, argc)
-        if r.resolved:
-            return r
-        return unique_name_fallback(ctx, name, argc)
+        return _same_file_exact(ctx, file_rel, name, argc)
 
     # ---- P2 接收器是类名(static 调用 / 工厂)----
     binding = next(
@@ -93,7 +99,7 @@ def resolve_site(site, caller: SymInfo | None, fs, ctx: ResolveContext) -> Casca
     if len(cls_cands) > 1:
         return CascadeResult.miss("ambiguous-class-name")
 
-    # ---- P3 接收器是实例(声明类型已知)----
+    # ---- P3 接收器是实例:类型已知才解析;未知 = 丢弃(护栏)----
     if site.receiver_type:
         typed = ctx.classes_by_name.get(site.receiver_type, [])
         if len(typed) == 1:
@@ -101,18 +107,13 @@ def resolve_site(site, caller: SymInfo | None, fs, ctx: ResolveContext) -> Casca
             if r.resolved:
                 return r
             return CascadeResult.miss("typed-receiver-no-method")  # 已知非边
-        return CascadeResult.miss("type-unknown-or-external")  # 库外类型,不兜底
-
-    # ---- P4 类型未知:唯一同名兜底 ----
-    return unique_name_fallback(ctx, name, argc)
+        return CascadeResult.miss("type-unknown-or-external")
+    return CascadeResult.miss("untyped-receiver")
 
 
 def resolve_new(site, caller: SymInfo | None, fs, ctx: ResolveContext) -> CascadeResult:
     """new Foo(...):库内类 → 构造器符号(无则类符号);库外 → miss。"""
     name = site.name
-    for info in ctx.classes_by_name.get(name, []):
-        # import 绑定优先精确定位
-        pass
     binding = next((b for b in fs.import_bindings if b.name == name), None)
     cls: SymInfo | None = None
     if binding is not None:

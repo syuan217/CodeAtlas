@@ -34,6 +34,7 @@ class CallSite:
     kind: str = "call"                # call / new / super
     line: int = 0
     col: int = 0
+    local_def: bool = False           # 调用名是 caller 词法局部(局部函数/回调参数)→ 不产边
 
 
 @dataclass
@@ -43,6 +44,7 @@ class ImportBinding:
     name: str      # 绑定名:java 类短名 / ts·py 命名导入名 / as 别名
     source: str    # 来源:java FQCN / ts 说明符 / py 点路径(可带相对点)
     kind: str      # "class"(java import 类) / "named"(命名导入) / "module"(整模块 as)
+    target_name: str | None = None  # as 别名时的导入原名(import {x as y} → x)
 
 
 @dataclass
@@ -127,13 +129,19 @@ def build_context(conn: sqlite3.Connection, repo_id: int) -> ResolveContext:
 def pick_unique(cands: list[SymInfo], arg_count: int | None) -> SymInfo | None:
     """唯一候选 → 命中;重载多候选按实参数量匹配唯一 → 命中;否则 None(歧义丢弃)。
 
-    注意:参数数量比较只在 arg_count 可得时使用,且签名参数个数不可靠时
-    (可变参数/泛型)放弃比较、直接判歧义——保守优先。
+    单候选也做参数个数一致性检查(签名可解析时)——M3 验收教训:实例调用
+    `dto.getXxx()` 曾绑到唯一同名的 `static getXxx(Serializable)`(元数不符)。
+    签名不可解析(可变参数等)则放弃比较、保守放行单候选。
     """
     if not cands:
         return None
     if len(cands) == 1:
-        return cands[0]
+        c = cands[0]
+        if arg_count is not None:
+            sig_argc = _signature_argc(c.signature)
+            if sig_argc is not None and sig_argc != arg_count:
+                return None
+        return c
     if arg_count is None:
         return None
     by_argc = [c for c in cands if _signature_argc(c.signature) == arg_count]
@@ -194,13 +202,21 @@ class CascadeResult:
 
 
 def unique_name_fallback(
-    ctx: ResolveContext, name: str, arg_count: int | None
+    ctx: ResolveContext,
+    name: str,
+    arg_count: int | None,
+    caller: SymInfo | None = None,
 ) -> CascadeResult:
     """同名兜底(级联最后一步):库内唯一 → heuristic;多候选/无 → miss。
 
+    排除 caller 自身(方法调自己不产边,M3 验收发现的自环红旗)。
     调用方必须先确认护栏(接收器类型未知)再进入本步。
     """
-    cands = ctx.methods_by_name.get(name, [])
+    cands = [
+        c
+        for c in ctx.methods_by_name.get(name, [])
+        if caller is None or c.id != caller.id
+    ]
     picked = pick_unique(cands, arg_count)
     if picked is not None:
         return CascadeResult.heuristic(picked, "unique-name")

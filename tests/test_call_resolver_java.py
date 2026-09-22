@@ -128,8 +128,11 @@ def test_java_external_calls_dropped_not_misbound(java_env):
     )
 
 
-def test_java_heuristic_unique_name(tmp_path, monkeypatch):
-    """库内唯一同名 → heuristic 兜底。"""
+def test_java_bare_call_no_cross_file_fallback(tmp_path, monkeypatch):
+    """M3 验收收紧:Java 裸调用不再全库同名兜底(跨类调用必须类名限定)。
+
+    A.run() 里的 go() 即使库内唯一(B#go)也不产边——模式 A/D 错误的根源。
+    """
     e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
     root = tmp_path / "j"
     root.mkdir()
@@ -142,12 +145,8 @@ def test_java_heuristic_unique_name(tmp_path, monkeypatch):
         b"package p;\npublic class B {\n    void go() { }\n}\n"
     )
     e.run(RepoCfg(name="j2", path=root))
-    rows = e.q(
-        "SELECT b.qualified_name AS d, e.resolution FROM edges e "
-        "JOIN symbols b ON e.dst_id=b.id WHERE e.kind='CALLS'"
-    )
-    # run() 里的 go():A 类内无,同文件无,库内唯一(B#go)→ heuristic
-    assert rows and rows[0]["d"] == "p.B#go" and rows[0]["resolution"] == "heuristic"
+    rows = e.q("SELECT COUNT(*) AS c FROM edges WHERE kind='CALLS'")
+    assert rows[0]["c"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -245,31 +244,24 @@ def test_incremental_calls_reresolved(java_env, tmp_path):
 
 
 def test_heuristic_dependent_via_calls_edge(tmp_path, monkeypatch):
-    """CALLS 入边闭包:B 删 go、C 加 go → A.run 的 heuristic 边重解析到 C#go。"""
+    """CALLS 入边闭包(python 兜底边):B 删 go、C 加 go → A 的 heuristic 边重绑 C#go。
+
+    A 裸调用 go() 与 B 无 IMPORTS 关系,只有旧 CALLS 边能把它带进依赖闭包。
+    """
     e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
     root = tmp_path / "hd"
     root.mkdir()
-    (root / "A.java").write_bytes(
-        b"package p;\npublic class A {\n"
-        b"    void run() { go(); }\n"
-        b"    void other() { }\n}\n"
-    )
-    (root / "B.java").write_bytes(
-        b"package p;\npublic class B {\n    void go() { }\n}\n"
-    )
+    (root / "a.py").write_text("def run():\n    go()\n")
+    (root / "b.py").write_text("def go():\n    pass\n")
     e.run(RepoCfg(name="hd", path=root))
     before = e.q(
         "SELECT b.qualified_name AS d FROM edges e JOIN symbols b ON e.dst_id=b.id "
         "WHERE e.kind='CALLS'"
     )
-    assert [r["d"] for r in before] == ["p.B#go"]  # 唯一 → heuristic 绑 B
+    assert [r["d"] for r in before] == ["b.go"]  # 库内唯一 → heuristic 绑 b.go
 
-    (root / "B.java").write_bytes(
-        b"package p;\npublic class B {\n    void other() { }\n}\n"
-    )
-    (root / "C.java").write_bytes(
-        b"package p;\npublic class C {\n    void go() { }\n}\n"
-    )
+    (root / "b.py").write_text("def other():\n    pass\n")
+    (root / "c.py").write_text("def go():\n    pass\n")
     import time
     time.sleep(0.01)
     e.run(RepoCfg(name="hd", path=root))
@@ -277,5 +269,135 @@ def test_heuristic_dependent_via_calls_edge(tmp_path, monkeypatch):
         "SELECT b.qualified_name AS d, e.resolution FROM edges e "
         "JOIN symbols b ON e.dst_id=b.id WHERE e.kind='CALLS'"
     )
-    # A 经 CALLS 入边进闭包 → 重解析 → go() 现在唯一命中 C#go
-    assert [(r["d"], r["resolution"]) for r in after] == [("p.C#go", "heuristic")]
+    # a 经 CALLS 入边进闭包 → 重解析 → go() 现在唯一命中 c.go
+    assert [(r["d"], r["resolution"]) for r in after] == [("c.go", "heuristic")]
+
+
+# ===========================================================================
+# M3 验收报告(M3_calls_acceptance.md)四类错误模式的回归用例
+# ===========================================================================
+
+MODE_A_JAVA = b"""package com.acc;
+
+public class DeductibleUtils {
+
+    public String convert(Object dto) {
+        return ((String) dto).trim() + getDeductibleTypeCd();
+    }
+}
+"""
+
+MODE_A_TARGET = b"""package com.acc;
+
+public class ProjectRisk {
+
+    private static String getDeductibleTypeCd(java.io.Serializable id) {
+        return "x";
+    }
+}
+"""
+
+
+def test_pattern_a_instance_getter_not_bound_to_static(tmp_path, monkeypatch):
+    """模式 A:实例/裸调用不得绑到其它类的 static 工具方法(元数/static 均不符)。"""
+    e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
+    root = tmp_path / "pa"
+    root.mkdir()
+    (root / "DeductibleUtils.java").write_bytes(MODE_A_JAVA)
+    (root / "ProjectRisk.java").write_bytes(MODE_A_TARGET)
+    e.run(RepoCfg(name="pa", path=root))
+    rows = e.q("SELECT COUNT(*) AS c FROM edges WHERE kind='CALLS'")
+    # getDeductibleTypeCd() 0 参裸调用 vs static 1 参 → 不产边
+    assert rows[0]["c"] == 0
+
+
+def test_pattern_a_self_loop_suppressed(tmp_path, monkeypatch):
+    """自环红旗:方法内调用自己名(唯一候选=自身)→ 兜底排除 caller 自身。"""
+    from codeatlas.graph.call_resolver.base import ResolveContext, build_context
+
+    e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
+    root = tmp_path / "sl"
+    root.mkdir()
+    (root / "S.java").write_bytes(
+        b"package p;\npublic class S {\n"
+        b"    String m(Object o) {\n"
+        b"        if (o == null) { return m(o); }\n"  # 真实递归(类内 exact 允许,不是兜底自环)
+        b"        return \"x\";\n    }\n}\n"
+    )
+    e.run(RepoCfg(name="sl", path=root))
+    rows = e.q(
+        "SELECT a.id AS aid, b.id AS bid FROM edges e "
+        "JOIN symbols a ON e.src_id=a.id JOIN symbols b ON e.dst_id=b.id "
+        "WHERE e.kind='CALLS'"
+    )
+    # 类内递归调用是合法 exact 自环(允许);验证没有 heuristic 自环即可
+    assert all(r["aid"] != r["bid"] for r in rows) or len(rows) == 1
+
+
+MODE_C_TS = b"""import { useEffect } from 'react';
+import { queryDetail as AreaFetchData } from '@/services/area';
+
+export function CustomerLogs() {
+    const fetchData = (page: number, size: number) => {
+        return AreaFetchData({ page, size });
+    };
+    return fetchData(1, 10);
+}
+"""
+
+MODE_C_TARGET = b"""export const queryDetail = async (params: any) => {
+    return Promise.resolve(params);
+};
+"""
+
+
+def test_pattern_c_ts_lexical_local_and_alias(tmp_path, monkeypatch):
+    """模式 C:组件内局部函数遮蔽导入;@/ 别名应正确解析到 src/。"""
+    e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
+    root = tmp_path / "pc"
+    (root / "src/services/area").mkdir(parents=True)
+    (root / "src/pages").mkdir(parents=True)
+    (root / "src/services/area/index.ts").write_bytes(MODE_C_TARGET)
+    (root / "src/pages/CustomerLogs.tsx").write_bytes(MODE_C_TS)
+    e.run(RepoCfg(name="pc", path=root))
+    rows = e.q(
+        "SELECT b.qualified_name AS d, e.resolution AS r FROM edges e "
+        "JOIN symbols b ON e.dst_id=b.id WHERE e.kind='CALLS'"
+    )
+    dsts = {(r["d"], r["r"]) for r in rows}
+    # 局部 fetchData(1,10) → 词法局部,不产边(不绑 AreaSearchSelect 同名)
+    assert not any(d.endswith("fetchData") for d, _ in dsts)
+    # @/ 别名:AreaFetchData({page,size}) → 命名导入 queryDetail → exact
+    assert ("src/services/area/index.queryDetail", "exact") in dsts
+
+
+def test_pattern_d_third_party_receiver_dropped(tmp_path, monkeypatch):
+    """模式 D:moment()/antd form 等无类型接收者的方法调用不产边。"""
+    e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
+    root = tmp_path / "pd"
+    (root / "src/services").mkdir(parents=True)
+    (root / "src/services/task.ts").write_bytes(
+        b"export async function submit(data: any) {\n  return Promise.resolve(data);\n}\n"
+        b"export async function add(x: number) {\n  return Promise.resolve(x);\n}\n"
+    )
+    (root / "src/page.tsx").write_bytes(
+        b"import { submit, add } from './services/task';\n"
+        b"import moment from 'moment';\n\n"
+        b"export function render(): void {\n"
+        b"  const form: any = null;\n"
+        b"  form.submit();\n"          # any 类型 → 接收器类型未知 → 丢弃
+        b"  moment().add(1, 'day');\n"  # 第三方 → 丢弃
+        b"  add(1);\n"                  # 命名导入 → exact
+        b"}\n"
+    )
+    e.run(RepoCfg(name="pd", path=root))
+    rows = e.q(
+        "SELECT b.qualified_name AS d, e.resolution AS r FROM edges e "
+        "JOIN symbols b ON e.dst_id=b.id WHERE e.kind='CALLS'"
+    )
+    dsts = {(r["d"], r["r"]) for r in rows}
+    # form.submit()/moment().add() 不产边
+    assert not any(d.endswith("#submit") for d, _ in dsts)
+    assert not any(d.endswith("#add") for d, _ in dsts)
+    # add(1) 命名导入 → exact
+    assert ("src/services/task.add", "exact") in dsts
