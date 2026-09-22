@@ -93,10 +93,10 @@ def test_persist_and_reload(parsed, tmp_path, monkeypatch):
     init_db(conn)
     persist_ddl(conn, parsed)
     n = conn.execute("SELECT COUNT(*) AS c FROM ddl_tables WHERE name LIKE 'testdb.%'").fetchone()["c"]
-    assert n == 2
+    assert n == 3
     persist_ddl(conn, parsed)  # 幂等
     n2 = conn.execute("SELECT COUNT(*) AS c FROM ddl_tables WHERE name LIKE 'testdb.%'").fetchone()["c"]
-    assert n2 == 2
+    assert n2 == 3
     conn.close()
 
 
