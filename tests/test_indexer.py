@@ -352,6 +352,26 @@ def test_incomplete_vectors_are_healed_on_rerun(env, tmp_path):
     assert env.lance().count() == env.count("chunks")
 
 
+def test_exclude_filters_git_changesets_too(env, tmp_path):
+    """git 模式下 tracked 的构建产物(exclude 匹配)不进索引。"""
+    root = tmp_path / "grepo"
+    root.mkdir()
+    (root / "src").mkdir()
+    (root / "src" / "A.java").write_text("package a;\npublic class A {}\n")
+    (root / "sub" / "target").mkdir(parents=True)  # 模拟历史误提交的产物
+    (root / "sub" / "target" / "Gen.class.lst").write_text("noise")
+    git_(root, "init")
+    git_(root, "add", "-A")  # target 产物也 tracked
+    git_(root, "commit", "-m", "init")
+
+    repo = RepoCfg(name="g", path=root, exclude=["**/target/"])
+    stats = env.run(repo)
+    assert stats.mode == "git"
+    assert stats.added == 1  # 只有 src/A.java
+    paths = {r["path"] for r in env.q("SELECT path FROM files")}
+    assert paths == {"src/A.java"}
+
+
 def test_full_forces_reparse(env, tmp_path):
     repo_root = copy_fixture("java_mini", tmp_path)
     repo = RepoCfg(name="jmini", path=repo_root)

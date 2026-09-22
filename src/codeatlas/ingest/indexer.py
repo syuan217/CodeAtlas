@@ -184,6 +184,16 @@ def index_repo(
     cs = compute_change_set(repo, None if full else base_commit, known, force_scan=full)
     stats.mode, stats.base_commit, stats.head_commit = cs.mode, cs.base_commit, cs.head_commit
 
+    # repos.yaml.exclude 在 .gitignore 之上再过滤一层,git 与 scan 两种模式都生效
+    # (git ls-files 可能包含历史误提交的构建产物)
+    if repo.exclude:
+        import pathspec
+
+        excl = pathspec.GitIgnoreSpec.from_lines(repo.exclude)
+        cs.changes = {
+            p: s for p, s in cs.changes.items() if not excl.match_file(p)
+        }
+
     lance = lance or LanceStore(settings)
 
     # 依赖闭包(PLAN §9.4 步骤 4):变更文件的 IMPORTS 入边依赖者,

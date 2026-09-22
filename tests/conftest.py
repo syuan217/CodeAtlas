@@ -7,6 +7,16 @@ import pytest
 from codeatlas.config import Settings
 from codeatlas.db.models import connect, init_db
 
+# 防火墙:任何测试都不得读到项目真实 .env(曾因 repos.yaml 变非空导致
+# 某测试意外用真实 API key 索引真实仓库,烧了约 5 元)。显式传 _env_file
+# 参数的构造不受影响(init 参数优先级高于 model_config)。
+_GUARD_ENV_FILE = "/nonexistent/codeatlas-test-guard.env"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_env(monkeypatch):
+    monkeypatch.setitem(Settings.model_config, "env_file", _GUARD_ENV_FILE)
+
 
 @pytest.fixture
 def settings(tmp_path) -> Settings:

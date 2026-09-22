@@ -70,7 +70,8 @@ def test_doctor_without_config_exits_nonzero(isolated_db, monkeypatch):
     assert ".env" in result.output
 
 
-def test_index_without_repos_exits_nonzero(isolated_db):
+def test_index_without_repos_exits_nonzero(isolated_db, monkeypatch):
+    monkeypatch.setattr(cli_mod, "load_repos", lambda: [])
     result = runner.invoke(cli_mod.app, ["index"])
     assert result.exit_code == 1
     assert "repos.yaml" in result.output
