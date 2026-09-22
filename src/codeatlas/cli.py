@@ -313,8 +313,9 @@ async def _ask(question: str, repo_name: str | None) -> None:
             if r_ is None:
                 continue
             sim = f" sim={cand.vec_sim:.2f}" if cand.vec_sim is not None else ""
+            loc = r_['fpath'] or f"wiki/{r_['title'] or ''}"  # wiki chunk 无 file_id
             console.print(
-                f"  [{r_['fpath']}:{r_['line_start']}-{r_['line_end']}] "
+                f"  [{loc}:{r_['line_start']}-{r_['line_end']}] "
                 f"{r_['title'] or ''}{sim} [dim]({'+'.join(sorted(cand.sources))})[/dim]"
             )
         price_note = "" if r.priced else "  [yellow](单价未知,cost=0)[/yellow]"
@@ -656,6 +657,66 @@ def audit(
             )
     finally:
         conn.close()
+
+
+async def _wiki(repo_name: str, concise: bool, max_pages: int | None, force: bool) -> None:
+    from codeatlas.config import load_repos
+    from codeatlas.db.lance import LanceStore
+    from codeatlas.gencode.wiki import generate_wiki
+
+    repos = [r for r in load_repos() if r.name == repo_name]
+    if not repos:
+        console.print(f"[red]repos.yaml 里没有 {repo_name!r}[/red]")
+        raise typer.Exit(code=1)
+    cfg = repos[0]
+    s = get_settings()
+    conn = connect()
+    init_db(conn)
+    repo_id = conn.execute(
+        "SELECT id FROM repos WHERE name=?", (repo_name,)
+    ).fetchone()
+    if repo_id is None or not conn.execute(
+        "SELECT COUNT(*) AS c FROM files WHERE repo_id=? AND parse_status='ok'",
+        (repo_id["id"],),
+    ).fetchone()["c"]:
+        console.print(f"[red]{repo_name} 尚未索引,先运行 atlas index --repo {repo_name}[/red]")
+        conn.close()
+        raise typer.Exit(code=1)
+
+    lance = LanceStore(s)
+    llm = LLMProvider(s, conn)
+    embedder = EmbeddingProvider(s, conn)
+    try:
+        with console.status("[bold]wiki 生成中…[/bold]"):
+            stats = await generate_wiki(
+                cfg, conn, llm, s, lance, embedder,
+                concise=concise, max_pages=max_pages,
+            )
+        console.print(
+            f"模块 {stats.modules} → 页面 {stats.pages_planned}(成功 {stats.pages_generated},"
+            f"失败 {stats.pages_failed})\n引用:{stats.citations_ok}/{stats.citations_total}"
+            f"通过,剔除 {stats.citations_removed}\n输出:{stats.output_dir}\n"
+            f"入库 chunks(kind=wiki):{stats.indexed_chunks}"
+        )
+        for e in stats.errors:
+            console.print(f"[yellow]{e}[/yellow]")
+        console.print("[dim]冷启动评审:阅读各页 front-matter 的 metrics 与正文质量,"
+                      "反馈后我调 prompts/ 升版本。[/dim]")
+    finally:
+        await llm.aclose()
+        await embedder.aclose()
+        conn.close()
+
+
+@app.command()
+def wiki(
+    repo: str = typer.Argument(..., help="仓库名(repos.yaml)"),
+    concise: bool = typer.Option(False, "--concise", help="4~6 页精简模式(冷启动推荐)"),
+    max_pages: int = typer.Option(None, "--max-pages", help="限制生成页数(冷启动试跑)"),
+    force: bool = typer.Option(False, "--force", help="强制重生成(人工保护仍然生效)"),
+) -> None:
+    """生成仓库 wiki(结构规划 → 逐页 grounding → 五层校验 → 入索引)。"""
+    asyncio.run(_wiki(repo, concise, max_pages, force))
 
 
 @app.command()

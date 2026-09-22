@@ -106,6 +106,9 @@ class Env:
             config.LANCEDB_DIR = new_lance
         self.settings = Settings(
             _env_file=None,
+            llm_base_url="http://llm.test/v1",
+            llm_api_key="sk-llm-test",
+            llm_model="test-model",
             embed_base_url="http://embed.test/v1",
             embed_api_key="sk-test",
             embed_model="test-embed",

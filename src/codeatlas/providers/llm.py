@@ -50,7 +50,7 @@ class LLMProvider:
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(180.0, connect=10.0),
+                timeout=httpx.Timeout(600.0, connect=10.0),
                 transport=self._transport,
             )
         return self._client
@@ -74,6 +74,7 @@ class LLMProvider:
         repo_id: int | None = None,
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        thinking_disabled: bool = False,
     ) -> ChatResult:
         if not (self.s.llm_base_url and self.s.llm_api_key and self.s.llm_model):
             raise ProviderError(
@@ -88,6 +89,10 @@ class LLMProvider:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if thinking_disabled:
+            # 思考型模型(如 GLM 系列):思考内容同样计入输出预算,
+            # 长文生成场景须关闭思考,否则正文可能被思考耗尽截断
+            payload["thinking"] = {"type": "disabled"}
         headers = {"Authorization": f"Bearer {self.s.llm_api_key}"}
 
         async with self._sem:
@@ -104,6 +109,13 @@ class LLMProvider:
             content = data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as e:
             raise ProviderError(f"LLM 响应缺 choices/message: {str(data)[:500]}") from e
+        usage0 = data.get("usage") or {}
+        completion0 = int(usage0.get("completion_tokens", 0))
+        if not content.strip() and max_tokens and completion0 >= max_tokens:
+            raise ProviderError(
+                f"输出被截断:completion_tokens={completion0} 已达 max_tokens={max_tokens},"
+                f"content 为空(思考型模型的思考内容耗尽了输出预算)"
+            )
         usage = data.get("usage") or {}
         prompt_tokens = int(usage.get("prompt_tokens", 0))
         completion_tokens = int(usage.get("completion_tokens", 0))
