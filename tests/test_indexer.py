@@ -49,7 +49,21 @@ def test_first_index_scan_mode_full_pipeline(env, tmp_path):
     # 符号:module×4 + class×3 + method×6(UserService 2 / User 3 / Strings 1)
     assert env.count("symbols") == stats.symbols == 13
     assert stats.contains_edges == 9  # 3 class 挂 module + 6 方法挂 class
-    assert env.count("edges") == stats.contains_edges + stats.import_edges
+    assert env.count("edges") == (
+        stats.contains_edges + stats.import_edges
+        + stats.call_edges_exact + stats.call_edges_heuristic
+    )
+    # CALLS:UserService 的调用(Strings.truncate/User.getName 等)有 exact 边
+    assert stats.call_edges_exact >= 3
+    calls = env.q(
+        "SELECT a.qualified_name AS c, b.qualified_name AS d, e.resolution "
+        "FROM edges e JOIN symbols a ON e.src_id=a.id JOIN symbols b ON e.dst_id=b.id "
+        "WHERE e.kind='CALLS'"
+    )
+    assert any(
+        r["d"] == "com.example.util.Strings#truncate" and r["resolution"] == "exact"
+        for r in calls
+    ), calls
 
     # IMPORTS 边:UserService → User、Strings
     imp = env.q(

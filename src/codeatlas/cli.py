@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -22,6 +23,14 @@ from codeatlas.config import (
 )
 from codeatlas.cost import cost_summary, model_summary, total_cost
 from codeatlas.db.models import connect, init_db
+from codeatlas.graph.queries import (
+    call_edges_stats,
+    callees_of,
+    callers_of,
+    find_symbols,
+    impact_of,
+    sample_call_edges,
+)
 from codeatlas.ingest.indexer import index_repo
 from codeatlas.providers._retry import CostLimitExceeded, ProviderError
 from codeatlas.providers.embedding import EmbeddingProvider, unpack_vector
@@ -327,6 +336,192 @@ def ask(
 ) -> None:
     """语义问答:融合检索 → 上下文组装 → LLM 单轮作答(带 文件:行号 引用)。"""
     asyncio.run(_ask(question, repo))
+
+
+def _resolve_symbol_or_exit(conn, pattern: str, repo: str | None):
+    repo_id = None
+    if repo:
+        row = conn.execute("SELECT id FROM repos WHERE name=?", (repo,)).fetchone()
+        if row is None:
+            console.print(f"[red]仓库 {repo!r} 未索引[/red]")
+            raise typer.Exit(code=1)
+        repo_id = row["id"]
+    syms = find_symbols(conn, pattern, repo_id)
+    if not syms:
+        console.print(f"[yellow]未找到符号:{pattern}[/yellow]")
+        raise typer.Exit(code=1)
+    if len(syms) > 1 and syms[0]["name"] != pattern and syms[0]["qualified_name"] != pattern:
+        console.print(f"[yellow]{pattern!r} 匹配到 {len(syms)} 个符号,请用完整 qualified_name:[/yellow]")
+        for s in syms[:15]:
+            console.print(f"  {s['qualified_name']}  ({s['fpath']}:{s['line_start']})")
+        raise typer.Exit(code=1)
+    return syms[0], repo_id
+
+
+def _print_call_edges(edges, title: str) -> None:
+    t = Table(title=title)
+    for col in ("调用方", "被调方", "resolution", "调用点"):
+        t.add_column(col)
+    for e in edges:
+        t.add_row(
+            e.src_qname, e.dst_qname, e.resolution or "-",
+            f"{e.src_file}:{e.line}" if e.src_file and e.line else "-",
+        )
+    console.print(t)
+    exact = sum(1 for e in edges if e.resolution == "exact")
+    console.print(f"[dim]共 {len(edges)} 条(exact {exact} / heuristic {len(edges) - exact})[/dim]")
+
+
+@app.command()
+def definition(
+    symbol: str = typer.Argument(..., help="符号名或 qualified_name"),
+    repo: str = typer.Option(None, "--repo"),
+) -> None:
+    """查看符号定义位置(文件:行)。"""
+    conn = connect()
+    try:
+        init_db(conn)
+        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
+        console.print(
+            f"[green]{sym['qualified_name']}[/green]  {sym['kind']}\n"
+            f"  位置:{sym['fpath']}:{sym['line_start']}-{sym['line_end']}\n"
+            f"  签名:{sym['signature'] or '-'}"
+        )
+    finally:
+        conn.close()
+
+
+@app.command("callers")
+def callers_cmd(
+    symbol: str = typer.Argument(...),
+    repo: str = typer.Option(None, "--repo"),
+) -> None:
+    """谁调用了这个符号(沿 CALLS 入边)。"""
+    conn = connect()
+    try:
+        init_db(conn)
+        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
+        _print_call_edges(callers_of(conn, sym), f"callers of {sym['qualified_name']}")
+    finally:
+        conn.close()
+
+
+@app.command("callees")
+def callees_cmd(
+    symbol: str = typer.Argument(...),
+    repo: str = typer.Option(None, "--repo"),
+) -> None:
+    """这个符号调用了谁(沿 CALLS 出边)。"""
+    conn = connect()
+    try:
+        init_db(conn)
+        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
+        _print_call_edges(callees_of(conn, sym), f"callees of {sym['qualified_name']}")
+    finally:
+        conn.close()
+
+
+@app.command()
+def impact(
+    symbol: str = typer.Argument(...),
+    repo: str = typer.Option(None, "--repo"),
+    depth: int = typer.Option(10, "--depth", help="最大传播深度"),
+) -> None:
+    """影响面:改这个符号会波及哪些方法(沿 CALLS 入边传播到不动点)。"""
+    conn = connect()
+    try:
+        init_db(conn)
+        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
+        rows = impact_of(conn, sym, max_depth=depth)
+        t = Table(title=f"impact of {sym['qualified_name']}")
+        for col in ("深度", "受影响符号", "文件"):
+            t.add_column(col)
+        for r in rows:
+            t.add_row(str(r["depth"]), r["qname"], r["file"])
+        console.print(t)
+        files = {r["file"] for r in rows}
+        console.print(
+            f"[dim]共 {len(rows)} 个方法 / {len(files)} 个文件受影响;"
+            f"depth=1 为直接调用方[/dim]"
+        )
+    finally:
+        conn.close()
+
+
+@app.command("calls-sample")
+def calls_sample(
+    n: int = typer.Option(30, "-n", help="抽样条数"),
+    resolution: str = typer.Option(None, "--resolution", help="exact / heuristic"),
+    repo: str = typer.Option(None, "--repo"),
+) -> None:
+    """M3 验收抽样:随机取 CALLS 边供人工核对。"""
+    conn = connect()
+    try:
+        init_db(conn)
+        repo_id = None
+        if repo:
+            row = conn.execute("SELECT id FROM repos WHERE name=?", (repo,)).fetchone()
+            if row is None:
+                console.print(f"[red]仓库 {repo!r} 未索引[/red]")
+                raise typer.Exit(code=1)
+            repo_id = row["id"]
+        console.print(f"全库 CALLS 边统计:{call_edges_stats(conn, repo_id)}")
+        edges = sample_call_edges(conn, n=n, resolution=resolution, repo_id=repo_id)
+        _print_call_edges(edges, f"随机抽样 {len(edges)} 条(resolution={resolution or '全部'})")
+        console.print(
+            "[dim]核对方法:打开调用点文件(调用点列),确认该行确实调用了被调方;"
+            "再打开被调方定义确认语义正确。[/dim]"
+        )
+    finally:
+        conn.close()
+
+
+@app.command("rebuild-calls")
+def rebuild_calls(
+    repo: str = typer.Option(None, "--repo", help="只处理指定仓库(缺省=全部已索引)"),
+) -> None:
+    """重算全库 CALLS 边(不动 chunks/向量;M3 补建或规则升级后使用)。"""
+    from codeatlas.config import RepoCfg as _RepoCfg
+    from codeatlas.graph.call_resolver.base import build_context
+    from codeatlas.graph.call_resolver.orchestrate import (
+        light_call_file,
+        resolve_and_write_calls,
+    )
+
+    conn = connect()
+    try:
+        init_db(conn)
+        rows = conn.execute(
+            "SELECT r.id, r.name, r.path, f.path AS rel FROM repos r "
+            "JOIN files f ON f.repo_id = r.id "
+            "WHERE f.parse_status = 'ok'" + (" AND r.name = ?" if repo else ""),
+            [repo] if repo else [],
+        ).fetchall()
+        if repo and not rows:
+            console.print(f"[red]仓库 {repo!r} 未索引或没有可解析文件[/red]")
+            raise typer.Exit(code=1)
+        by_repo: dict[int, dict] = {}
+        for r in rows:
+            by_repo.setdefault(
+                r["id"], {"name": r["name"], "path": r["path"], "rels": []}
+            )["rels"].append(r["rel"])
+        for repo_id, info in by_repo.items():
+            cfg = _RepoCfg(name=info["name"], path=Path(info["path"]))
+            with console.status(f"[bold]{info['name']}[/bold] 重算 CALLS 边…"):
+                ctx = build_context(conn, repo_id)
+                call_files = []
+                for rel in info["rels"]:
+                    cf = light_call_file(conn, cfg, rel)
+                    if cf is not None:
+                        call_files.append(cf)
+                stats = resolve_and_write_calls(conn, repo_id, call_files, ctx)
+            console.print(
+                f"{info['name']}: 调用点 {stats.sites} → exact {stats.exact} / "
+                f"heuristic {stats.heuristic} / 丢弃 {stats.dropped}"
+                f"(写入 {stats.edges_written} 条)"
+            )
+    finally:
+        conn.close()
 
 
 @app.command()

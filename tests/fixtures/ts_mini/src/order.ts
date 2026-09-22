@@ -18,7 +18,7 @@ export class Cart {
 }
 
 export function renderCart(cart: Cart): string {
-  return \`total=\${formatAmount(cart.totalCents())}\`;
+  return "total=" + formatAmount(cart.totalCents());
 }
 
 export function buildCart(raw: string): Cart {

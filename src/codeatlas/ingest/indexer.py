@@ -24,7 +24,16 @@ from codeatlas.db.models import connect, init_db
 from codeatlas.ingest.chunker import chunk_text
 from codeatlas.ingest.gitdiff import compute_change_set
 from codeatlas.ingest.imports_resolver import ImportRef, write_import_edges
-from codeatlas.ingest.symbols import detect_language, extract_symbols
+from codeatlas.graph.call_resolver.orchestrate import (
+    CallFile,
+    light_call_file,
+    resolve_and_write_calls,
+)
+from codeatlas.ingest.symbols import (
+    detect_language,
+    extract_call_sites,
+    extract_symbols,
+)
 from codeatlas.ingest.walker import BINARY_SNIFF_BYTES, MAX_FILE_BYTES, sniff_binary
 from codeatlas.providers.embedding import EmbeddingProvider
 
@@ -51,6 +60,9 @@ class IndexStats:
     chunks: int = 0
     embedded: int = 0
     orphan_vectors_deleted: int = 0
+    call_sites: int = 0
+    call_edges_exact: int = 0
+    call_edges_heuristic: int = 0
     duration_s: float = 0.0
 
     def summary_line(self) -> str:
@@ -61,6 +73,8 @@ class IndexStats:
             f"{self.skipped_unknown_ext} failed={self.parse_failed} | "
             f"symbols={self.symbols} edges(C/I)={self.contains_edges}/{self.import_edges} "
             f"chunks={self.chunks} embedded={self.embedded} "
+            f"calls(E+H/D)={self.call_edges_exact}+{self.call_edges_heuristic}/"
+            f"{self.call_sites - self.call_edges_exact - self.call_edges_heuristic} "
             f"orphans-{self.orphan_vectors_deleted} "
             f"({self.duration_s:.1f}s)"
         )
@@ -225,6 +239,7 @@ def index_repo(
     # ---- added / modified ----
     pending = sorted((r, s) for r, s in cs.changes.items() if s != "D")
     import_refs: list[ImportRef] = []
+    call_files: list[CallFile] = []
     embed_pending: list[tuple[int, str, str]] = []  # (chunk_id, kind, content)
 
     for batch_start in range(0, len(pending), BATCH_FILES):
@@ -232,7 +247,7 @@ def index_repo(
         for rel, status in batch:
             _process_file(
                 conn, lance, repo, repo_id, rel, status, cs.head_commit,
-                settings, stats, import_refs, embed_pending, force=full,
+                settings, stats, import_refs, embed_pending, call_files, force=full,
             )
         conn.commit()
 
@@ -277,6 +292,16 @@ def index_repo(
             import_refs.append(ImportRef(module_id["id"], rel, fs[0], fs[1]))
     stats.import_edges = write_import_edges(conn, repo_id, import_refs)
 
+    # ---- CALLS Pass2(PLAN §9.4 步骤 4:M3 生效——依赖闭包重解析调用边)----
+    for rel in sorted(dependent_rels):
+        cf = light_call_file(conn, repo, rel)
+        if cf is not None:
+            call_files.append(cf)
+    call_stats = resolve_and_write_calls(conn, repo_id, call_files)
+    stats.call_sites = call_stats.sites
+    stats.call_edges_exact = call_stats.exact
+    stats.call_edges_heuristic = call_stats.heuristic
+
     # ---- 基线推进(最后一步,git 模式专属)----
     if cs.mode == "git" and cs.head_commit:
         conn.execute(
@@ -303,7 +328,11 @@ def index_repo(
 def _dependent_files(
     conn: sqlite3.Connection, repo_id: int, changes: dict[str, str]
 ) -> set[str]:
-    """反查 IMPORTS 入边 1 层:谁 import 了变更文件。须在删除子树前调用。"""
+    """反查 1 层依赖者(PLAN §9.4 步骤 4:IMPORTS/CALLS 入边)。须在删除子树前调用。
+
+    CALLS 入边覆盖 heuristic 兜底边:裸调用他文件方法不产生 IMPORTS 边,
+    唯有旧 CALLS 边能暴露这种依赖。
+    """
     rels = list(changes)
     if not rels:
         return set()
@@ -314,7 +343,8 @@ def _dependent_files(
         f"JOIN files dstf ON d.file_id = dstf.id "
         f"JOIN symbols s ON e.src_id = s.id "
         f"JOIN files df ON s.file_id = df.id "
-        f"WHERE e.repo_id = ? AND e.kind = 'IMPORTS' AND dstf.path IN ({ph})",
+        f"WHERE e.repo_id = ? AND e.kind IN ('IMPORTS', 'CALLS') "
+        f"AND dstf.path IN ({ph})",
         [repo_id, *rels],
     ).fetchall()
     return {r["p"] for r in rows}
@@ -336,7 +366,7 @@ def _light_imports(repo: RepoCfg, rel: str) -> tuple[str, list[str]] | None:
 
 def _process_file(
     conn, lance, repo, repo_id, rel, status, head_commit, settings, stats,
-    import_refs, embed_pending, force: bool = False,
+    import_refs, embed_pending, call_files, force: bool = False,
 ) -> None:
     abs_path = repo.path / rel
     try:
@@ -421,3 +451,11 @@ def _process_file(
     stats.chunks += len(chunks)
 
     import_refs.append(ImportRef(module_id, rel, lang, fs.imports))
+    call_files.append(
+        CallFile(
+            fs=fs,
+            sym_ids=sym_ids,
+            module_id=module_id,
+            sites=extract_call_sites(rel, lang, raw, fs),
+        )
+    )

@@ -173,34 +173,48 @@ def _symbol_recall(conn: sqlite3.Connection, query: str, repo_id: int | None):
 def _graph_expand(
     conn: sqlite3.Connection, sym_ids: list[int], repo_id: int | None, hops: int
 ) -> list[int]:
-    """命中符号沿 CONTAINS/IMPORTS 扩展的 chunk(M2 版,无 CALLS 边)。
+    """命中符号的图扩展 chunk(M3 版,装填优先级 PLAN §9.5):
 
-    装填优先级:同文件符号(同模块)> IMPORTS 一跳邻文件 > 二跳。
+    直接调用(CALLS 一跳,exact 优先)> 同模块(同文件)> IMPORTS 二跳。
     """
     if not sym_ids:
         return []
     collected: list[int] = []
+    ph = ",".join("?" * len(sym_ids))
 
     def chunks_of_symbols(sids: list[int]) -> list[int]:
-        ph = ",".join("?" * len(sids))
+        if not sids:
+            return []
+        p = ",".join("?" * len(sids))
         return [
             r["id"] for r in conn.execute(
-                f"SELECT id FROM chunks WHERE symbol_id IN ({ph})", sids
+                f"SELECT id FROM chunks WHERE symbol_id IN ({p})", sids
             )
         ]
 
     def chunks_of_files(fids: list[int]) -> list[int]:
         if not fids:
             return []
-        ph = ",".join("?" * len(fids))
+        p = ",".join("?" * len(fids))
         return [
             r["id"] for r in conn.execute(
-                f"SELECT id FROM chunks WHERE file_id IN ({ph})", fids
+                f"SELECT id FROM chunks WHERE file_id IN ({p})", fids
             )
         ]
 
-    # 优先级 1:命中符号所在文件的全部符号 chunk(同模块)
-    ph = ",".join("?" * len(sym_ids))
+    # 优先级 1:CALLS 一跳邻居(exact 边优先:先取 exact 再取 heuristic)
+    for target_res in ("exact", "heuristic"):
+        rows = conn.execute(
+            f"SELECT e.dst_id AS d, e.src_id AS s FROM edges e "
+            f"WHERE e.kind='CALLS' AND e.resolution=? "
+            f"AND (e.src_id IN ({ph}) OR e.dst_id IN ({ph}))",
+            [target_res, *sym_ids, *sym_ids],
+        ).fetchall()
+        neighbors = list({r["d"] for r in rows} | {r["s"] for r in rows})
+        neighbors = [n for n in neighbors if n not in set(sym_ids)]
+        collected += chunks_of_symbols(neighbors)
+
+    # 优先级 2:同文件符号(同模块)
     hit_files = [
         r["file_id"] for r in conn.execute(
             f"SELECT DISTINCT file_id FROM symbols WHERE id IN ({ph})", sym_ids
@@ -208,19 +222,19 @@ def _graph_expand(
     ]
     collected += chunks_of_files(hit_files)
 
-    # 沿 IMPORTS 边跳(出边=它依赖谁,入边=谁依赖它),每跳取邻文件 chunk
+    # 优先级 3:沿 IMPORTS 跳(它依赖谁 / 谁依赖它)
     frontier_files = hit_files
     seen_files = set(hit_files)
     for _hop in range(max(1, hops)):
         if not frontier_files:
             break
-        ph = ",".join("?" * len(frontier_files))
+        p = ",".join("?" * len(frontier_files))
         rows = conn.execute(
             f"SELECT DISTINCT f2.id AS fid FROM edges e "
             f"JOIN symbols a ON e.src_id = a.id "
             f"JOIN symbols b ON e.dst_id = b.id "
             f"JOIN files f2 ON b.file_id = f2.id "
-            f"WHERE a.file_id IN ({ph}) AND e.kind IN ('IMPORTS','CONTAINS')",
+            f"WHERE a.file_id IN ({p}) AND e.kind = 'IMPORTS'",
             frontier_files,
         ).fetchall()
         next_files = [r["fid"] for r in rows if r["fid"] not in seen_files]
