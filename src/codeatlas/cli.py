@@ -358,13 +358,20 @@ def _resolve_symbol_or_exit(conn, pattern: str, repo: str | None):
     return syms[0], repo_id
 
 
+def _pretty_qname(qname: str) -> str:
+    """展示用 qname:去掉重载消歧后缀 @line(v2 验收 #8/#37/#48 记法问题)。"""
+    import re
+
+    return re.sub(r"@\d+$", "", qname)
+
+
 def _print_call_edges(edges, title: str) -> None:
     t = Table(title=title)
     for col in ("调用方", "被调方", "resolution", "调用点"):
         t.add_column(col)
     for e in edges:
         t.add_row(
-            e.src_qname, e.dst_qname, e.resolution or "-",
+            _pretty_qname(e.src_qname), _pretty_qname(e.dst_qname), e.resolution or "-",
             f"{e.src_file}:{e.line}" if e.src_file and e.line else "-",
         )
     console.print(t)
