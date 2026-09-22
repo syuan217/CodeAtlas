@@ -51,6 +51,7 @@ WIKI_DIR = DATA_DIR / "wiki"
 DOCS_DIR = DATA_DIR / "docs"
 PROFILES_DIR = DATA_DIR / "profiles"
 REPORTS_DIR = DATA_DIR / "reports"
+DDL_DIR = DATA_DIR / "ddl"  # 人工维护:生产 DDL 导出文件(mysqldump --no-data / SHOW CREATE TABLE)
 
 
 class Settings(BaseSettings):
@@ -174,7 +175,7 @@ _DOCS_README = """# data/docs —— 人工维护文档目录
 
 def ensure_dirs() -> None:
     """创建运行时目录;首次创建时在 data/docs/ 放说明。"""
-    for d in (DATA_DIR, LANCEDB_DIR, WIKI_DIR, DOCS_DIR, PROFILES_DIR, REPORTS_DIR):
+    for d in (DATA_DIR, LANCEDB_DIR, WIKI_DIR, DOCS_DIR, PROFILES_DIR, REPORTS_DIR, DDL_DIR):
         d.mkdir(parents=True, exist_ok=True)
     readme = DOCS_DIR / "README.md"
     if not readme.exists():
