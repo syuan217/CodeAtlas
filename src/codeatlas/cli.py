@@ -532,6 +532,121 @@ def rebuild_calls(
 
 
 @app.command()
+def collect(
+    schema: str = typer.Option(None, "--schema", help="只处理指定库(缺省=data/ddl 全部)"),
+) -> None:
+    """生成画像采集脚本与人工回填模板(只读 SELECT;OB 无直连账号的人工模式)。"""
+    from codeatlas.config import DDL_DIR, PROFILES_DIR
+    from codeatlas.schema.collect_ob import (
+        generate_scripts,
+        manual_template,
+    )
+    from codeatlas.schema.ddl import load_ddl_dir
+
+    parsed_all = load_ddl_dir(DDL_DIR)
+    if not parsed_all:
+        console.print(f"[red]{DDL_DIR} 下没有 DDL 文件(.sql/.md)[/red]")
+        raise typer.Exit(code=1)
+    targets = {schema: parsed_all[schema]} if schema else parsed_all
+    scripts = generate_scripts(targets)
+    templates = [manual_template(s, p_) for s, p_ in targets.items()]
+    for s in scripts:
+        console.print(f"采集脚本:[green]{s}[/green]")
+    for tp in templates:
+        console.print(f"回填模板:[green]{tp}[/green]")
+    console.print(
+        "\n[dim]流程:在生产执行 *_queries.sql(全部只读)→ 将结果按模板填入 "
+        "*_manual.json(不确定的项保持 null)→ 重新运行 atlas audit 即纳入统计类规则。"
+        "慢查询清单也填入模板的 slow_queries 段。[/dim]"
+    )
+
+
+@app.command()
+def audit(
+    repos: str = typer.Option(None, "--repos", help="限定扫描的仓库,逗号分隔(缺省=repos.yaml 全部)"),
+) -> None:
+    """OceanBase 索引体检:DDL 解析 + 代码 SQL 访问路径 + 规则引擎 + 报告。"""
+    from codeatlas.config import DDL_DIR, PROFILES_DIR, load_repos
+    from codeatlas.ingest.indexer import upsert_repo
+    from codeatlas.schema.audit import (
+        persist_findings,
+        render_report,
+        run_audit,
+    )
+    from codeatlas.schema.collect_ob import apply_profile, load_manual
+    from codeatlas.schema.ddl import load_ddl_dir, persist_ddl
+    from codeatlas.schema.sql_extract import extract_repo, persist_query_map
+
+    conn = connect()
+    try:
+        init_db(conn)
+        parsed_all = load_ddl_dir(DDL_DIR)
+        if not parsed_all:
+            console.print(f"[red]{DDL_DIR} 下没有 DDL 文件[/red]")
+            raise typer.Exit(code=1)
+
+        # 1) DDL 入库
+        for schema, p_ in parsed_all.items():
+            persist_ddl(conn, p_)
+        total_fail = sum(len(p_.failures) for p_ in parsed_all.values())
+        console.print(
+            f"DDL:{len(parsed_all)} 库 / {sum(len(p_.tables) for p_ in parsed_all.values())} 表"
+            + (f"(解析失败 {total_fail} 段)" if total_fail else "")
+        )
+
+        # 2) 画像回填(存在即应用)
+        for schema in parsed_all:
+            mp = PROFILES_DIR / f"{schema}_manual.json"
+            if mp.exists():
+                try:
+                    n = apply_profile(conn, schema, load_manual(mp))
+                    console.print(f"画像回填:{schema}({n} 表)")
+                except Exception as e:
+                    console.print(f"[yellow]画像 {schema} 回填失败:{e}[/yellow]")
+
+        # 3) 代码 SQL 提取(全部登记仓库;未涉及库的表自然不进规则)
+        cfgs = load_repos()
+        if repos:
+            only = {r.strip() for r in repos.split(",")}
+            cfgs = [c for c in cfgs if c.name in only]
+        anti_patterns: list[dict] = []
+        for cfg in cfgs:
+            if not cfg.path.is_dir():
+                continue
+            repo_id = upsert_repo(conn, cfg)
+            qs = extract_repo(cfg, cfg.path)
+            persist_query_map(conn, repo_id, qs)
+            for q in qs:
+                for ap in q.anti_patterns:
+                    anti_patterns.append({**ap, "fingerprint": q.fingerprint,
+                                          "source_file": q.source_file,
+                                          "source_line": q.source_line})
+            console.print(f"SQL 提取:{cfg.name}({len(qs)} 条语句)")
+        qmap = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT DISTINCT query_fingerprint, source_file, source_line, "
+                "table_name, column_name, usage, freq FROM query_column_map"
+            )
+        ]
+
+        # 4) 规则引擎 + 报告
+        results = [run_audit(conn, schema, qmap, anti_patterns)
+                   for schema in parsed_all]
+        report = render_report(results)
+        persist_findings(conn, results)
+        total = sum(len(r.findings) for r in results)
+        console.print(f"\nfindings 共 [bold]{total}[/bold] 条;报告:[green]{report}[/green]")
+        for r in results:
+            console.print(
+                f"  {r.schema}: {len(r.findings)} findings"
+                + (f"(unavailable: {','.join(r.unavailable)})" if r.unavailable else "")
+            )
+    finally:
+        conn.close()
+
+
+@app.command()
 def doctor() -> None:
     """连通性体检:两个端点各一次最小调用,打印模型/维度/费用。"""
     asyncio.run(_doctor())
