@@ -1,4 +1,4 @@
-"""config.py:默认值、.env 覆盖、单价查找、repos.yaml 加载。"""
+"""config.py:默认值、.env 覆盖、单价查找、repos.yaml 加载、DATA_DIR 解析。"""
 
 from pathlib import Path
 
@@ -10,6 +10,38 @@ from codeatlas.config import (
     lookup_embed_price,
     lookup_llm_price,
 )
+
+
+def test_data_dir_default_and_env_override(monkeypatch):
+    # 默认:项目内 data/
+    monkeypatch.delenv("DATA_DIR", raising=False)
+    assert config._resolve_data_dir() == config.PROJECT_ROOT / "data"
+    # shell 环境变量优先
+    monkeypatch.setenv("DATA_DIR", "/tmp/custom-data")
+    assert config._resolve_data_dir() == Path("/tmp/custom-data")
+
+
+def test_data_dir_reads_env_file_single_key(monkeypatch, tmp_path):
+    monkeypatch.delenv("DATA_DIR", raising=False)
+    env = tmp_path / ".env"
+    env.write_text(
+        "DATA_DIR=/tmp/from-dotenv\nLLM_API_KEY=secret\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(config, "ENV_FILE", env)
+    import os
+
+    before = dict(os.environ)
+    assert config._resolve_data_dir() == Path("/tmp/from-dotenv")
+    # 只解析 DATA_DIR 单键:LLM_API_KEY 不被灌进 os.environ
+    assert os.environ == before
+
+
+def test_data_dir_env_var_beats_env_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATA_DIR", "/tmp/from-shell")
+    env = tmp_path / ".env"
+    env.write_text("DATA_DIR=/tmp/from-dotenv\n", encoding="utf-8")
+    monkeypatch.setattr(config, "ENV_FILE", env)
+    assert config._resolve_data_dir() == Path("/tmp/from-shell")
 
 
 def test_key_defaults_isolated_from_env_file():

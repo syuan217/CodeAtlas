@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,17 +16,41 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
+ENV_FILE = PROJECT_ROOT / ".env"
+REPOS_YAML = PROJECT_ROOT / "repos.yaml"
+
+
+def _resolve_data_dir() -> Path:
+    """DATA_DIR 可配置:shell 环境变量 > .env 中 DATA_DIR 行 > 默认 项目内 data/。
+
+    只解析 .env 里的 DATA_DIR 单键,不用 load_dotenv 整体加载——
+    避免把服务商 key 灌进 os.environ,破坏测试与进程隔离。
+    需在模块常量求值前执行,kb.sqlite / lancedb / wiki 等路径统一从这里派生。
+    """
+    val = os.environ.get("DATA_DIR")
+    if val is None and ENV_FILE.exists():
+        try:
+            for line in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                key, _, raw = line.partition("=")
+                if key.strip() == "DATA_DIR":
+                    val = raw.split(" #")[0].strip().strip('"').strip("'")
+                    break
+        except OSError:
+            pass
+    return Path(val) if val else PROJECT_ROOT / "data"
+
+
 # 运行时目录(整体 gitignore,见 PLAN §6/§13)
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = _resolve_data_dir()
 DB_PATH = DATA_DIR / "kb.sqlite"
 LANCEDB_DIR = DATA_DIR / "lancedb"
 WIKI_DIR = DATA_DIR / "wiki"
 DOCS_DIR = DATA_DIR / "docs"
 PROFILES_DIR = DATA_DIR / "profiles"
 REPORTS_DIR = DATA_DIR / "reports"
-
-ENV_FILE = PROJECT_ROOT / ".env"
-REPOS_YAML = PROJECT_ROOT / "repos.yaml"
 
 
 class Settings(BaseSettings):
