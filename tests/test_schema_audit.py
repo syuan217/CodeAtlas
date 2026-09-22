@@ -238,3 +238,48 @@ def test_generate_scripts_readonly(audit_env, tmp_path):
     # 只读保障:全文不含任何写操作语句
     for kw in ("INSERT", "UPDATE ", "DELETE", "ALTER", "DROP", "CREATE", "TRUNCATE"):
         assert f" {kw}" not in text.upper().replace("--", ""), kw
+
+
+def test_fill_sheet_roundtrip(tmp_path):
+    """填报表生成 → 人工填写 → 导入为 manual.json → apply_profile 生效。"""
+    import json as _json
+
+    from codeatlas.schema.collect_ob import (
+        apply_profile,
+        generate_fill_sheet,
+        import_fill_sheet,
+    )
+
+    p = parse_ddl("testdb", OB_DDL)
+    sheet = generate_fill_sheet({"testdb": p}, out_dir=tmp_path)
+    text = sheet.read_text(encoding="utf-8")
+    assert "t_order" in text
+    assert "t_tmp_scratch" not in text  # temp/tmp 排除
+    assert "## 慢查询" in text
+
+    # 模拟人工填写
+    text = text.replace(
+        "| t_order |  |  |  |  |  |", "| t_order | 2,300 | 5 | 1 | 90000 | 重点表 |"
+    ).replace(
+        "|  |  |  |  |  |  |",
+        "| testdb | SELECT * FROM t_order WHERE id = 1 | 120 | 35 | 8000 | 1 |",
+        1,
+    )
+    filled = tmp_path / "filled_sheet.md"
+    filled.write_text(text, encoding="utf-8")
+    written = import_fill_sheet(filled, {"testdb": p}, out_dir=tmp_path)
+    assert len(written) == 1
+    data = _json.loads(written[0].read_text(encoding="utf-8"))
+    assert data["tables"]["t_order"]["row_count"] == 2300
+    assert data["tables"]["t_order"]["data_length"] == 5
+    assert data["slow_queries"][0]["freq"] == 120
+
+    conn = connect()
+    init_db(conn)
+    persist_ddl(conn, p)
+    apply_profile(conn, "testdb", data)
+    row = conn.execute(
+        "SELECT row_count, data_length FROM ddl_tables WHERE name='testdb.t_order'"
+    ).fetchone()
+    assert row["row_count"] == 2300 and row["data_length"] == 5
+    conn.close()

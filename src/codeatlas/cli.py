@@ -534,11 +534,16 @@ def rebuild_calls(
 @app.command()
 def collect(
     schema: str = typer.Option(None, "--schema", help="只处理指定库(缺省=data/ddl 全部)"),
+    import_sheet: Path = typer.Option(
+        None, "--import", help="导入已填写的 fill_sheet.md,转为各库 *_manual.json"
+    ),
 ) -> None:
-    """生成画像采集脚本与人工回填模板(只读 SELECT;OB 无直连账号的人工模式)。"""
+    """画像采集(人工模式):生成填报表/只读脚本;--import 导入填好的表。"""
     from codeatlas.config import DDL_DIR, PROFILES_DIR
     from codeatlas.schema.collect_ob import (
+        generate_fill_sheet,
         generate_scripts,
+        import_fill_sheet,
         manual_template,
     )
     from codeatlas.schema.ddl import load_ddl_dir
@@ -548,16 +553,23 @@ def collect(
         console.print(f"[red]{DDL_DIR} 下没有 DDL 文件(.sql/.md)[/red]")
         raise typer.Exit(code=1)
     targets = {schema: parsed_all[schema]} if schema else parsed_all
+
+    if import_sheet is not None:
+        written = import_fill_sheet(import_sheet, targets, out_dir=PROFILES_DIR)
+        for w in written:
+            console.print(f"已导入画像:[green]{w}[/green]")
+        console.print("[dim]重新运行 atlas audit 即生效(IDX101 等统计规则)。[/dim]")
+        return
+
+    sheet = generate_fill_sheet(targets)
+    console.print(f"汇总填报表(推荐人工填写):[green]{sheet}[/green]")
     scripts = generate_scripts(targets)
     templates = [manual_template(s, p_) for s, p_ in targets.items()]
     for s in scripts:
-        console.print(f"采集脚本:[green]{s}[/green]")
-    for tp in templates:
-        console.print(f"回填模板:[green]{tp}[/green]")
+        console.print(f"采集脚本(可选,DBA 执行):[green]{s}[/green]")
+    console.print(f"[dim]另有 JSON 模板 {len(templates)} 个(索引基数/列区分度等更细粒度可选)。[/dim]")
     console.print(
-        "\n[dim]流程:在生产执行 *_queries.sql(全部只读)→ 将结果按模板填入 "
-        "*_manual.json(不确定的项保持 null)→ 重新运行 atlas audit 即纳入统计类规则。"
-        "慢查询清单也填入模板的 slow_queries 段。[/dim]"
+        "[dim]填完 fill_sheet.md 后:uv run atlas collect --import <该文件> → atlas audit。[/dim]"
     )
 
 
