@@ -154,9 +154,14 @@ def ensure_dirs() -> None:
         readme.write_text(_DOCS_README, encoding="utf-8")
 
 
+def hash_bytes(data: bytes) -> str:
+    """blake2b HEX 前 32 位(bytes 版;files.hash 对原始字节哈希,不依赖编码)。"""
+    return hashlib.blake2b(data, digest_size=16).hexdigest()
+
+
 def content_hash(text: str) -> str:
-    """blake2b HEX 前 32 位。files.hash / chunks.content_hash / embed_cache 共用。"""
-    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+    """blake2b HEX 前 32 位。chunks.content_hash / embed_cache 共用。"""
+    return hash_bytes(text.encode("utf-8"))
 
 
 def load_repos(path: Path | None = None) -> list[RepoCfg]:

@@ -1,6 +1,7 @@
 """cli.py:status/cost/doctor 的命令行行为(不触网)。"""
 
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -67,6 +68,29 @@ def test_doctor_without_config_exits_nonzero(isolated_db, monkeypatch):
     result = runner.invoke(cli_mod.app, ["doctor"])
     assert result.exit_code == 1
     assert ".env" in result.output
+
+
+def test_index_without_repos_exits_nonzero(isolated_db):
+    result = runner.invoke(cli_mod.app, ["index"])
+    assert result.exit_code == 1
+    assert "repos.yaml" in result.output
+
+
+def test_index_without_embed_config_exits_nonzero(isolated_db, monkeypatch, tmp_path):
+    import shutil as _sh
+
+    from codeatlas.config import RepoCfg
+
+    src = Path(__file__).parent / "fixtures" / "java_mini"
+    dst = tmp_path / "java_mini"
+    _sh.copytree(src, dst)
+    monkeypatch.setattr(
+        cli_mod, "load_repos", lambda: [RepoCfg(name="jmini", path=dst)]
+    )
+    monkeypatch.setattr(cli_mod, "get_settings", lambda: Settings(_env_file=None))
+    result = runner.invoke(cli_mod.app, ["index"])
+    assert result.exit_code == 1
+    assert "Embedding 未配置" in result.output
 
 
 def test_doctor_with_mock_endpoints(isolated_db, monkeypatch, settings):

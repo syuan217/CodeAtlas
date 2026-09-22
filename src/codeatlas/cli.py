@@ -22,6 +22,7 @@ from codeatlas.config import (
 )
 from codeatlas.cost import cost_summary, model_summary, total_cost
 from codeatlas.db.models import connect, init_db
+from codeatlas.ingest.indexer import index_repo
 from codeatlas.providers._retry import CostLimitExceeded, ProviderError
 from codeatlas.providers.embedding import EmbeddingProvider, unpack_vector
 from codeatlas.providers.llm import LLMProvider
@@ -175,6 +176,45 @@ async def _doctor() -> None:
     conn.close()
     if not ok:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def index(
+    repo: str = typer.Option(None, "--repo", help="只索引指定仓库(缺省 = repos.yaml 全部)"),
+    full: bool = typer.Option(False, "--full", help="忽略 git 基线,强制全量重解析"),
+) -> None:
+    """索引 repos.yaml 中的仓库:遍历→符号→切块→FTS→embedding→LanceDB。"""
+    repos = load_repos()
+    if not repos:
+        console.print("[yellow]repos.yaml 里没有仓库;请编辑 repos.yaml 填入本地路径[/yellow]")
+        raise typer.Exit(code=1)
+    if repo:
+        repos = [r for r in repos if r.name == repo]
+        if not repos:
+            console.print(f"[red]repos.yaml 里没有名为 {repo!r} 的仓库[/red]")
+            raise typer.Exit(code=1)
+    missing = [str(r.path) for r in repos if not r.path.is_dir()]
+    if missing:
+        console.print(f"[red]仓库路径不存在:{', '.join(missing)}[/red]")
+        raise typer.Exit(code=1)
+
+    s = get_settings()
+    if not (s.embed_base_url and s.embed_api_key and s.embed_model):
+        console.print(
+            "[red]Embedding 未配置:atlas index 需要 .env 里的 EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    for r in repos:
+        console.rule(f"index {r.name}")
+        try:
+            stats = index_repo(r, settings=s, full=full)
+        except (ProviderError, CostLimitExceeded) as e:
+            console.print(f"[red]{r.name} 索引中断:{e}[/red]")
+            raise typer.Exit(code=1)
+        console.print(stats.summary_line())
+        if stats.mode == "git" and stats.head_commit:
+            console.print(f"[dim]indexed_commit → {stats.head_commit[:12]}[/dim]")
 
 
 @app.command()
