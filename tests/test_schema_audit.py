@@ -46,6 +46,14 @@ CREATE TABLE `t_no_pk` (
   `code` varchar(32) NOT NULL
 );
 ```
+
+## t_tmp_scratch
+
+```sql
+CREATE TABLE `t_tmp_scratch` (
+  `id` bigint(20) NOT NULL
+);
+```
 """
 
 
@@ -55,7 +63,7 @@ def parsed():
 
 
 def test_parse_ddl_md_fences_and_ob_options(parsed):
-    assert len(parsed.tables) == 2
+    assert len(parsed.tables) == 3
     assert not parsed.failures
     order = next(t for t in parsed.tables if t.name == "t_order")
     cols = {c.name: c for c in order.columns}
@@ -183,6 +191,10 @@ def test_rules_end_to_end(audit_env):
     rules = {f.rule_id for f in result.findings}
 
     assert "TBL001" in rules          # t_no_pk 无主键
+    tbl001_tables = {f.table for f in result.findings if f.rule_id == "TBL001"}
+    assert "t_no_pk" in tbl001_tables
+    assert "t_tmp_scratch" not in tbl001_tables  # temp/tmp 排除约定
+    assert "t_tmp_scratch" in result.excluded_tables
     assert "IDX003" in rules          # idx_org_code ⊂ idx_status_org
     assert "IDX004" in rules          # t_no_pk.code join 无索引
     assert "IDX005" in rules          # like CONCAT('%'...) 前导通配
@@ -205,7 +217,7 @@ def test_profile_apply_activates_rules(audit_env, tmp_path):
     mp = tmp_path / "filled.json"
     mp.write_text(json.dumps(data))
     n = apply_profile(conn, "testdb", json.loads(mp.read_text()))
-    assert n == 2
+    assert n == 3
     row = conn.execute(
         "SELECT row_count FROM ddl_tables WHERE name='testdb.t_order'"
     ).fetchone()

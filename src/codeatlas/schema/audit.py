@@ -46,6 +46,13 @@ class AuditResult:
     unavailable: list[str] = field(default_factory=list)  # 画像缺失的规则
     table_count: int = 0
     query_count: int = 0
+    excluded_tables: list[str] = field(default_factory=list)  # 按约定排除的表
+
+
+def _is_excluded(table_name: str) -> bool:
+    """用户约定(2026-09-22):临时表(temp/tmp)不纳入体检。"""
+    low = table_name.lower()
+    return "temp" in low or "tmp" in low
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +76,8 @@ def _load_tables(conn: sqlite3.Connection, schema: str) -> dict[str, Tbl]:
         "SELECT id, name, row_count FROM ddl_tables WHERE name LIKE ?", (prefix,)
     ):
         bare = r["name"].split(".", 1)[1]
+        if _is_excluded(bare):
+            continue
         cols = {
             c["name"]: (c["data_type"] or "")
             for c in conn.execute(
@@ -310,10 +319,18 @@ def run_audit(
     anti_patterns: list[dict],
 ) -> AuditResult:
     tables = _load_tables(conn, schema)
+    excluded = [
+        r["name"].split(".", 1)[1]
+        for r in conn.execute(
+            "SELECT name FROM ddl_tables WHERE name LIKE ?", (f"{schema}.%",)
+        )
+        if _is_excluded(r["name"].split(".", 1)[1])
+    ]
     result = AuditResult(
         schema=schema,
         table_count=len(tables),
         query_count=len({q["query_fingerprint"] for q in qmap}),
+        excluded_tables=sorted(excluded),
     )
     result.findings += rule_tbl001(tables)
     result.findings += rule_idx001(qmap, tables)
@@ -373,6 +390,11 @@ def render_report(results: list[AuditResult]) -> Path:
             lines.append(
                 f"- ⚠️ 画像缺失,以下规则未执行(标 unavailable):"
                 f"{', '.join(r.unavailable)}"
+            )
+        if r.excluded_tables:
+            lines.append(
+                f"- 按约定排除临时表(temp/tmp)共 {len(r.excluded_tables)} 张:"
+                f"{', '.join(r.excluded_tables)}"
             )
         lines.append("")
         by_rule: dict[str, list[Finding]] = {}
