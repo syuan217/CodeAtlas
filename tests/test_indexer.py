@@ -3,97 +3,14 @@
 mock embedding(MockTransport)替代真实 API;库与 LanceDB 全部指向 tmp_path。
 """
 
-import json
 import shutil
-import subprocess
 from pathlib import Path
 
-import httpx
 import pytest
 
-from codeatlas import config
-from codeatlas.config import RepoCfg, Settings
+from codeatlas.config import RepoCfg
 from codeatlas.db.fts import fts_search
-from codeatlas.db.lance import LanceStore
-from codeatlas.db.models import connect, init_db
-from codeatlas.ingest.indexer import index_repo
-from codeatlas.providers.embedding import EmbeddingProvider
-
-FIXTURES = Path(__file__).parent / "fixtures"
-
-
-class FakeEmbedServer:
-    def __init__(self, dim=4):
-        self.dim = dim
-        self.request_count = 0
-
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.request_count += 1
-        body = json.loads(request.content)
-        data = [
-            {"index": i, "embedding": [0.01 * ((i % 97) + 1)] * self.dim}
-            for i in range(len(body["input"]))
-        ]
-        return httpx.Response(
-            200, json={"data": data, "usage": {"total_tokens": len(body["input"])}}
-        )
-
-
-class Env:
-    """每个测试一套隔离环境:库 + LanceDB + provider(挂同一 conn)。"""
-
-    def __init__(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config, "DB_PATH", tmp_path / "kb.sqlite")
-        monkeypatch.setattr(config, "LANCEDB_DIR", tmp_path / "lancedb")
-        self.settings = Settings(
-            _env_file=None,
-            embed_base_url="http://embed.test/v1",
-            embed_api_key="sk-test",
-            embed_model="test-embed",
-            embed_dim=4,
-            embed_batch_size=64,
-            chunk_max_tokens=512,
-            max_concurrency=4,
-            cost_limit_per_run=50.0,
-        )
-        self.conn = connect()
-        init_db(self.conn)
-        self.server = FakeEmbedServer()
-
-    def provider(self) -> EmbeddingProvider:
-        return EmbeddingProvider(
-            self.settings, self.conn,
-            transport=httpx.MockTransport(self.server), backoff_base=0,
-        )
-
-    def run(self, repo: RepoCfg, **kw):
-        return index_repo(
-            repo, settings=self.settings, embed_provider=self.provider(),
-            conn=self.conn, **kw
-        )
-
-    def lance(self) -> LanceStore:
-        return LanceStore(self.settings)
-
-    def q(self, sql: str, *params):
-        return self.conn.execute(sql, params).fetchall()
-
-    def one(self, sql: str, *params):
-        return self.conn.execute(sql, params).fetchone()
-
-    def count(self, table: str) -> int:
-        return self.one(f"SELECT COUNT(*) AS c FROM {table}")["c"]
-
-
-@pytest.fixture
-def env(tmp_path, monkeypatch) -> Env:
-    return Env(tmp_path, monkeypatch)
-
-
-def copy_fixture(name: str, tmp: Path) -> Path:
-    dst = tmp / name
-    shutil.copytree(FIXTURES / name, dst)
-    return dst
+from conftest import FIXTURES, Env, FakeEmbedServer, copy_fixture, git_
 
 
 def chunk_ids_by_file(env: Env) -> dict[str, set[int]]:
@@ -103,16 +20,6 @@ def chunk_ids_by_file(env: Env) -> dict[str, set[int]]:
     out: dict[str, set[int]] = {}
     for r in rows:
         out.setdefault(r["p"], set()).add(r["cid"])
-    return out
-
-
-def chunk_hashes_by_file(env: Env) -> dict[str, set[str]]:
-    rows = env.q(
-        "SELECT f.path AS p, c.content_hash AS h FROM chunks c JOIN files f ON c.file_id=f.id"
-    )
-    out: dict[str, set[str]] = {}
-    for r in rows:
-        out.setdefault(r["p"], set()).add(r["h"])
     return out
 
 
@@ -265,13 +172,6 @@ def test_binary_large_unknown_skipped(env, tmp_path):
 # ---------------------------------------------------------------------------
 # git 模式:基线推进
 # ---------------------------------------------------------------------------
-
-def git_(cwd, *args) -> None:
-    subprocess.run(
-        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "-C", str(cwd), *args],
-        check=True, capture_output=True,
-    )
-
 
 def test_git_mode_baseline_advances(env, tmp_path):
     root = tmp_path / "grepo"

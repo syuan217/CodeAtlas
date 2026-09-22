@@ -26,6 +26,9 @@ from codeatlas.ingest.indexer import index_repo
 from codeatlas.providers._retry import CostLimitExceeded, ProviderError
 from codeatlas.providers.embedding import EmbeddingProvider, unpack_vector
 from codeatlas.providers.llm import LLMProvider
+from codeatlas.retrieve.context import build_context
+from codeatlas.retrieve.rerank import maybe_rerank
+from codeatlas.retrieve.search import retrieve
 
 app = typer.Typer(help="codeatlas · 本地代码知识库", no_args_is_help=True)
 console = Console()
@@ -237,6 +240,93 @@ def repair_vectors() -> None:
         )
     finally:
         conn.close()
+
+
+QA_SYSTEM_PROMPT = (
+    "你是代码库问答助手。只基于 <context> 标签内提供的代码片段回答问题;"
+    "引用代码时使用格式 [相对路径:起始行-结束行](行号必须来自片段开头的 [lines A-B] 标注,"
+    "不得自行推算);上下文不足以回答时明确说\"知识库中未找到\",禁止编造。"
+    "回答使用与问题相同的语言。"
+)
+
+
+async def _ask(question: str, repo_name: str | None) -> None:
+    s = get_settings()
+    conn = connect()
+    init_db(conn)
+    repo_id = None
+    if repo_name:
+        row = conn.execute("SELECT id FROM repos WHERE name=?", (repo_name,)).fetchone()
+        if row is None:
+            console.print(f"[red]仓库 {repo_name!r} 未索引(先运行 atlas index --repo {repo_name})[/red]")
+            conn.close()
+            raise typer.Exit(code=1)
+        repo_id = row["id"]
+
+    from codeatlas.db.lance import LanceStore
+
+    lance = LanceStore(s)
+    embedder = EmbeddingProvider(s, conn)
+    llm = LLMProvider(s, conn)
+    try:
+        cands = await retrieve(question, s, conn, embedder, lance, repo_id=repo_id)
+        corpus = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
+        cands = maybe_rerank(question, cands, s, corpus)
+        if not cands:
+            console.print("[yellow]知识库中未找到相关内容(候选为空)。[/yellow]")
+            return
+        context, used = build_context(
+            conn, cands, top_n=s.context_top_n,
+            budget_tokens=s.llm_context_window - 2048,
+        )
+        if not context:
+            console.print("[yellow]知识库中未找到相关内容(上下文组装为空)。[/yellow]")
+            return
+
+        messages = [
+            {"role": "system", "content": QA_SYSTEM_PROMPT},
+            {"role": "user",
+             "content": f"<context>\n{context}\n</context>\n\n问题:{question}"},
+        ]
+        r = await llm.chat(messages, stage="ask", repo_id=repo_id)
+        console.print(Panel(r.content, title="回答"))
+        # 引用清单(来自实际装填的候选)
+        console.print("[bold]引用来源(检索命中,供核对):[/bold]")
+        ph = ",".join("?" * len(used))
+        rows = conn.execute(
+            f"SELECT c.id AS cid, c.title, c.line_start, c.line_end, f.path AS fpath "
+            f"FROM chunks c LEFT JOIN files f ON c.file_id=f.id WHERE c.id IN ({ph})",
+            [c.chunk_id for c in used],
+        ).fetchall()
+        by_id = {r_["cid"]: r_ for r_ in rows}
+        for cand in used:
+            r_ = by_id.get(cand.chunk_id)
+            if r_ is None:
+                continue
+            sim = f" sim={cand.vec_sim:.2f}" if cand.vec_sim is not None else ""
+            console.print(
+                f"  [{r_['fpath']}:{r_['line_start']}-{r_['line_end']}] "
+                f"{r_['title'] or ''}{sim} [dim]({'+'.join(sorted(cand.sources))})[/dim]"
+            )
+        price_note = "" if r.priced else "  [yellow](单价未知,cost=0)[/yellow]"
+        console.print(
+            f"[dim]召回 {len(cands)} 条 → 装填 {len(used)} 条;"
+            f"本次费用 {r.cost:.6f} 元(tokens {r.prompt_tokens}+{r.completion_tokens})"
+            f"{price_note}[/dim]"
+        )
+    finally:
+        await embedder.aclose()
+        await llm.aclose()
+        conn.close()
+
+
+@app.command()
+def ask(
+    question: str = typer.Argument(..., help="自然语言问题"),
+    repo: str = typer.Option(None, "--repo", help="限定检索的仓库(缺省=全部)"),
+) -> None:
+    """语义问答:融合检索 → 上下文组装 → LLM 单轮作答(带 文件:行号 引用)。"""
+    asyncio.run(_ask(question, repo))
 
 
 @app.command()

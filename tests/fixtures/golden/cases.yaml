@@ -1,0 +1,24 @@
+# golden set:问题 → 期望命中文件(相对各 fixture 仓库根)。
+# 断言:期望文件 ∈ 检索 top-k 候选所在文件集合(默认 k=3)。
+# 真实仓库的语义质量靠 atlas ask 手动验收;本文件锁定检索管线回归。
+cases:
+  - question: "如何实现字符串截断 truncate"
+    expect_files: ["com/example/util/Strings.java"]
+  - question: "如何校验用户信息 validate"
+    expect_files: ["com/example/service/UserService.java"]
+  - question: "User 实体有哪些字段和 getter"
+    expect_files: ["com/example/model/User.java"]
+  - question: "购物车 Cart 总价 totalCents 怎么算"
+    expect_files: ["src/order.ts"]
+  - question: "金额解析 parseAmount"
+    expect_files: ["src/util.ts"]
+  - question: "clamp 区间限制"
+    expect_files: ["pkg/mod.py"]
+  - question: "Counter 计数器 bump"
+    expect_files: ["pkg/mod.py"]
+  - question: "渲染购物车 renderCart"
+    expect_files: ["src/order.ts"]
+  - question: "summarize 汇总用户"
+    expect_files: ["com/example/service/UserService.java"]
+  - question: "金额格式化 formatAmount"
+    expect_files: ["src/util.ts"]

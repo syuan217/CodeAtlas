@@ -108,7 +108,9 @@ class RepoCfg(BaseModel):
 # ---------------------------------------------------------------------------
 
 LLM_PRICES: dict[str, tuple[float, float]] = {
-    # bigmodel(GLM 系列)
+    # bigmodel(GLM 系列;flash 系列为免费档,如实际收费请用 .env 覆盖)
+    "glm-5.3-flash": (0.0, 0.0),
+    "glm-5.3": (1.0, 4.0),
     "glm-4.7": (0.6, 2.2),
     "glm-4.6": (0.6, 2.2),
     "glm-4.5": (0.6, 2.2),
