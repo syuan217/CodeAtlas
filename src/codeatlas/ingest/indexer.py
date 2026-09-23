@@ -436,9 +436,15 @@ def _process_file(
     text = raw.decode("utf-8", errors="replace")
     chunks = chunk_text(text, lang, fs, settings.chunk_max_tokens)
     title_to_local: dict[str, int] = {s.qualified_name: i for i, s in enumerate(fs.symbols)}
+    seen_chunk_keys: set = set()
     for ch in chunks:
         local_idx = title_to_local.get(ch.title or "")
         symbol_id = sym_ids.get(local_idx) if local_idx is not None else None
+        # 文件内重复内容块去重(如 md 重复段落):否则撞 idx_chunks_dedup 唯一索引
+        key = (ch.kind, symbol_id if symbol_id is not None else 0, ch.content_hash)
+        if key in seen_chunk_keys:
+            continue
+        seen_chunk_keys.add(key)
         c = conn.execute(
             "INSERT INTO chunks(repo_id, file_id, symbol_id, kind, title, content, "
             "content_hash, line_start, line_end) VALUES(?,?,?,?,?,?,?,?,?)",

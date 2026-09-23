@@ -50,7 +50,7 @@ def test_key_defaults_isolated_from_env_file():
     s = Settings(_env_file=None)
     assert s.llm_context_window == 128000
     assert s.embed_dim == 1024
-    assert s.embed_batch_size == 64
+    assert s.embed_batch_size == 20  # qwan 兼容端点单批上限
     assert s.max_concurrency == 4
     assert s.cost_limit_per_run == 50.0
     assert s.chunk_max_tokens == 512
