@@ -143,7 +143,8 @@ async def _doctor() -> None:
     llm = LLMProvider(s, conn)
     try:
         r = await llm.chat(
-            [{"role": "user", "content": "ping"}], stage="doctor", max_tokens=8
+            [{"role": "user", "content": "ping"}], stage="doctor",
+            max_tokens=64, thinking_disabled=True,
         )
         llm_ms = (time.perf_counter() - t0) * 1000
         llm_line = (
