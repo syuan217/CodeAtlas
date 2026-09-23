@@ -156,10 +156,18 @@ class Env:
     def count(self, table: str) -> int:
         return self.one(f"SELECT COUNT(*) AS c FROM {table}")["c"]
 
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
 
 @pytest.fixture
-def env(tmp_path, monkeypatch) -> Env:
-    return Env(tmp_path, monkeypatch)
+def env(tmp_path, monkeypatch):
+    e = Env(tmp_path, monkeypatch)
+    yield e
+    e.close()
 
 
 def copy_fixture(name: str, tmp: Path) -> Path:

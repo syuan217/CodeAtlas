@@ -21,6 +21,7 @@ class ChatResult:
     completion_tokens: int
     cost: float
     priced: bool  # False = 单价表查不到,cost 恒 0(unknown)
+    tool_calls: list | None = None  # OpenAI function calling(M6 agent)
 
 
 class LLMProvider:
@@ -75,6 +76,7 @@ class LLMProvider:
         temperature: float = 0.2,
         max_tokens: int | None = None,
         thinking_disabled: bool = False,
+        tools: list[dict] | None = None,
     ) -> ChatResult:
         if not (self.s.llm_base_url and self.s.llm_api_key and self.s.llm_model):
             raise ProviderError(
@@ -93,6 +95,8 @@ class LLMProvider:
             # 思考型模型(如 GLM 系列):思考内容同样计入输出预算,
             # 长文生成场景须关闭思考,否则正文可能被思考耗尽截断
             payload["thinking"] = {"type": "disabled"}
+        if tools:
+            payload["tools"] = tools
         headers = {"Authorization": f"Bearer {self.s.llm_api_key}"}
 
         async with self._sem:
@@ -116,6 +120,15 @@ class LLMProvider:
                 f"输出被截断:completion_tokens={completion0} 已达 max_tokens={max_tokens},"
                 f"content 为空(思考型模型的思考内容耗尽了输出预算)"
             )
+        message = data["choices"][0]["message"]
+        tool_calls = [
+            {
+                "id": tc.get("id") or f"call_{i}",
+                "name": (tc.get("function") or {}).get("name", ""),
+                "arguments": (tc.get("function") or {}).get("arguments", "{}"),
+            }
+            for i, tc in enumerate(message.get("tool_calls") or [])
+        ]
         usage = data.get("usage") or {}
         prompt_tokens = int(usage.get("prompt_tokens", 0))
         completion_tokens = int(usage.get("completion_tokens", 0))
@@ -147,4 +160,5 @@ class LLMProvider:
             completion_tokens=completion_tokens,
             cost=cost,
             priced=priced,
+            tool_calls=tool_calls or None,
         )

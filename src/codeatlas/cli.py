@@ -859,6 +859,70 @@ def index_docs_cmd() -> None:
         conn.close()
 
 
+async def _agent(question: str, repo_name: str | None, max_turns: int) -> None:
+    from codeatlas.agent.loop import DEFAULT_MAX_TURNS, run_agent
+    from codeatlas.agent.tools import ToolBox
+    from codeatlas.db.lance import LanceStore
+    from codeatlas.retrieve.search import retrieve
+
+    s = get_settings()
+    conn = connect()
+    init_db(conn)
+    repo_id = None
+    repo_root = None
+    if repo_name:
+        row = conn.execute("SELECT id, path FROM repos WHERE name=?", (repo_name,)).fetchone()
+        if row is None:
+            console.print(f"[red]仓库 {repo_name!r} 未索引[/red]")
+            conn.close()
+            raise typer.Exit(code=1)
+        repo_id, repo_root = row["id"], Path(row["path"])
+
+    lance = LanceStore(s)
+    embedder = EmbeddingProvider(s, conn)
+    llm = LLMProvider(s, conn)
+
+    async def _retrieve(query: str):
+        return await retrieve(
+            query, s, conn, embedder, lance, repo_id=repo_id
+        )
+
+    toolbox = ToolBox(conn, repo_root, repo_id, retriever=_retrieve)
+    try:
+        with console.status("[bold]agent 思考中…[/bold]"):
+            result = await run_agent(
+                question, llm, conn, toolbox, repo_name=repo_name,
+                max_turns=max_turns or DEFAULT_MAX_TURNS,
+            )
+        console.print(Panel(result.answer, title="回答"))
+        if result.tool_trace:
+            console.print("[bold]工具调用轨迹:[/bold]")
+            for i, c in enumerate(result.tool_trace, 1):
+                args_short = str(c["args"])[:60]
+                console.print(
+                    f"  {i}. {c['tool']}({args_short}) → {c['result_chars']} 字符"
+                )
+        console.print(
+            f"[dim]轮数 {result.turns} · 工具调用 {len(result.tool_trace)} 次 · "
+            f"tokens {result.prompt_tokens}+{result.completion_tokens} · "
+            f"费用 {result.cost:.6f} 元[/dim]"
+        )
+    finally:
+        await embedder.aclose()
+        await llm.aclose()
+        conn.close()
+
+
+@app.command()
+def agent(
+    question: str = typer.Argument(..., help="问题(支持多跳分析)"),
+    repo: str = typer.Option(None, "--repo", help="限定仓库"),
+    max_turns: int = typer.Option(6, "--max-turns", help="工具调用轮数上限"),
+) -> None:
+    """agent 问答:LLM 自主调用检索/调用链/读文件工具,多轮收集证据后作答。"""
+    asyncio.run(_agent(question, repo, max_turns))
+
+
 @app.command()
 def doctor() -> None:
     """连通性体检:两个端点各一次最小调用,打印模型/维度/费用。"""

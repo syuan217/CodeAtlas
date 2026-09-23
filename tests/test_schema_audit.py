@@ -182,7 +182,8 @@ def audit_env(tmp_path, monkeypatch):
         for ap in q.anti_patterns:
             anti.append({**ap, "fingerprint": q.fingerprint,
                          "source_file": q.source_file, "source_line": q.source_line})
-    return conn, qmap, anti
+    yield conn, qmap, anti
+    conn.close()
 
 
 def test_rules_end_to_end(audit_env):
@@ -240,9 +241,12 @@ def test_generate_scripts_readonly(audit_env, tmp_path):
         assert f" {kw}" not in text.upper().replace("--", ""), kw
 
 
-def test_fill_sheet_roundtrip(tmp_path):
+def test_fill_sheet_roundtrip(tmp_path, monkeypatch):
     """填报表生成 → 人工填写 → 导入为 manual.json → apply_profile 生效。"""
     import json as _json
+
+    from codeatlas import config as _cfg
+    monkeypatch.setattr(_cfg, "DB_PATH", tmp_path / "rt.sqlite")
 
     from codeatlas.schema.collect_ob import (
         apply_profile,
