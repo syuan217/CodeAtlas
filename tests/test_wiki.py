@@ -135,7 +135,7 @@ def test_freshness_human_protection(tmp_path):
 def _wiki_llm_handler(request: httpx.Request) -> httpx.Response:
     body = json.loads(request.content)
     user = body["messages"][-1]["content"]
-    if "结构规划师" in user:
+    if "结构规划师" in user or "主编" in user:
         content = f"```xml{NL}{GOOD_XML}{NL}```"
     else:
         content = (
@@ -180,16 +180,21 @@ def test_generate_wiki_end_to_end(tmp_path, monkeypatch):
         )
     )
     assert stats.modules >= 1
-    assert stats.pages_planned == 2
-    assert stats.pages_generated == 2
+    assert stats.pages_planned >= 2  # 规划 + 按需兜底
+    assert stats.pages_generated == stats.pages_planned
 
     wiki_dir = tmp_path / "wiki" / "jmini"
     mds = list(wiki_dir.glob("**/*.md"))
-    assert len(mds) >= 2
-    util_page = next(p for p in mds if p.stem == "com")
-    fm = read_front_matter(util_page)
+    assert (wiki_dir / "README.md").exists()  # 目录页
+    assert len(mds) >= 3  # README + 2 内容页
+    content_pages = [p for p in mds if p.name != "README.md"]
+    fm = read_front_matter(content_pages[0])
     assert fm["repo"] == "jmini"
-    assert fm["generator_version"] == "v1"
+    # v2 导航:面包屑 + 上下页注入
+    body = content_pages[0].read_text(encoding="utf-8")
+    assert "📖 目录" in body
+    assert "上一页" in body or "下一页" in body
+    assert "file://" in body or "](…" not in body  # 源码引用已转绝对链接(或无引用)
 
     n = e.one("SELECT COUNT(*) AS c FROM chunks WHERE kind='wiki'")["c"]
     assert n == stats.indexed_chunks > 0

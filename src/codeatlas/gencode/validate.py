@@ -15,7 +15,8 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CITATION_RE = re.compile(r"\[([^\]:]+):(\d+)-(\d+)\]")
+CITATION_RE = re.compile(r"\[([^\]:]+):(\d+)-(\d+)\]")           # v1: [path:A-B]
+LINK_CITATION_RE = re.compile(r"\[([^\]]*)\]\(([^):]+):(\d+)-(\d+)\)")  # v2: [文字](path:A-B)
 FENCE_BLOCK_RE = re.compile(r"```[a-zA-Z]*\n(.*?)```", re.S)
 UNVERIFIED_MARK = "[未验证]"
 _MAX_SNIPPET_SEARCH = 400  # snippet 反查的文件大小上限(KB)
@@ -30,6 +31,7 @@ class PageMetrics:
     symbol_coverage: float = 0.0
     mermaid_ok: bool = True
     mermaid_issues: list[str] = field(default_factory=list)
+    code_blocks: int = 0          # v2:代码块数量(≤2 为宜)
     errors: list[str] = field(default_factory=list)
 
     def front_matter_dict(self) -> dict:
@@ -40,6 +42,7 @@ class PageMetrics:
             "citations_removed": self.citations_removed,
             "symbol_coverage": round(self.symbol_coverage, 3),
             "mermaid_ok": self.mermaid_ok,
+            "code_blocks": self.code_blocks,
         }
 
 
@@ -162,11 +165,22 @@ def validate_page(
     file_map = _page_file_map(conn, repo_id)
     cache: dict[str, list[str]] = {}
 
-    citations = list(CITATION_RE.finditer(md))
+    # v2 行内链接式 + v1 文本式双格式统一为 (path, a, b, 原文, 替换目标)
+    raw_citations: list[tuple[str, int, int, str, str]] = []
+    for m in LINK_CITATION_RE.finditer(md):
+        raw_citations.append(
+            (m.group(2).strip(), int(m.group(3)), int(m.group(4)),
+             m.group(0), f"[{m.group(1)}]({{}})"))
+    for m in CITATION_RE.finditer(md):
+        if LINK_CITATION_RE.search(m.group(0)):
+            continue
+        raw_citations.append(
+            (m.group(1).strip(), int(m.group(2)), int(m.group(3)),
+             m.group(0), "[{}]"))
+    citations = raw_citations
     metrics.citations_total = len(citations)
-    to_remove: list[tuple[str, str]] = []
-    for m in citations:
-        path, a, b = m.group(1).strip(), int(m.group(2)), int(m.group(3))
+    to_remove: list[tuple[str, str, str]] = []  # (path, range, 原文)
+    for path, a, b, raw, _fmt in citations:
         md, action = _fix_or_remove_citation(md, path, a, b, file_map, cache)
         if action in ("ok",):
             metrics.citations_ok += 1
@@ -174,15 +188,16 @@ def validate_page(
             metrics.citations_ok += 1
             metrics.citations_fixed += 1
         elif action in ("missing-path", "bad-range", "snippet-not-found"):
-            to_remove.append((path, f"{a}-{b}"))
+            to_remove.append((path, f"{a}-{b}", raw))
             metrics.errors.append(f"{path}:{a}-{b} {action}")
-        # retry-signal 由调用方(生成器)处理:这里直接剔除并标记
 
-    for path, rng in to_remove:
+    for path, rng, raw in to_remove:
+        display = raw.split("](")[0].lstrip("[")
         md = md.replace(
-            f"[{path}:{rng}]", f"~~{path}:{rng}~~{UNVERIFIED_MARK}"
+            raw, f"~~{display} ({path}:{rng})~~{UNVERIFIED_MARK}"
         )
     metrics.citations_removed = len(to_remove)
+    metrics.code_blocks = len(re.findall(r"```[a-zA-Z]", md))
 
     metrics.mermaid_ok, metrics.mermaid_issues = check_mermaid(md)
     metrics.symbol_coverage = symbol_coverage(md, conn, repo_id, file_paths)
