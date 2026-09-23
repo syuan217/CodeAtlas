@@ -437,3 +437,60 @@ def persist_findings(conn: sqlite3.Connection, results: list[AuditResult]) -> No
                 ),
             )
     conn.commit()
+
+
+async def index_report(conn, lance, embedder, report_path, settings) -> int:
+    """报告 chunk 入索引(PLAN §9.8:报告入向量库,供 atlas ask 引用)。
+
+    kind=report;重跑 audit 自动替换旧报告 chunk。
+    """
+    import asyncio
+
+    from codeatlas.db.fts import fts_delete
+    from codeatlas.ingest.chunker import chunk_markdown
+
+    old = conn.execute(
+        "SELECT id, content FROM chunks WHERE kind='report'"
+    ).fetchall()
+    for r in old:
+        fts_delete(conn, r["id"], r["content"])
+    conn.execute("DELETE FROM chunks WHERE kind='report'")
+    conn.commit()
+
+    # 报告不属于单仓库:哨兵 repo 行承载外键(schema 勿动,PLAN 约束)
+    conn.execute(
+        "INSERT INTO repos(name, path, languages) VALUES('__codeatlas_reports__', '', '[]') "
+        "ON CONFLICT(name) DO UPDATE SET path=''"
+    )
+    conn.commit()
+    repo_id = conn.execute(
+        "SELECT id FROM repos WHERE name='__codeatlas_reports__'"
+    ).fetchone()["id"]
+    n = 0
+    pending = []
+    text = Path(report_path).read_text(encoding="utf-8", errors="replace")
+    for ch in chunk_markdown(text, settings.chunk_max_tokens):
+        cur = conn.execute(
+            "INSERT INTO chunks(repo_id, kind, title, content, content_hash, "
+            "line_start, line_end) VALUES(?,?,?,?,?,?,?)",
+            (repo_id, "report", f"report:{Path(report_path).stem}:{ch.title or ''}",
+             ch.content, ch.content_hash, ch.line_start, ch.line_end),
+        )
+        pending.append((cur.lastrowid, ch.content))
+        n += 1
+    conn.commit()
+    if embedder is not None and pending:
+        try:
+            vectors = await embedder.embed(
+                [c for _, c in pending], stage="audit"
+            )
+            rows = [(cid, repo_id, "report", b) for (cid, _), b in zip(pending, vectors)]
+            for lance_id, chunk_id in lance.add_vectors(rows):
+                conn.execute(
+                    "INSERT INTO vector_refs(chunk_id, lance_id, model) VALUES(?,?,?)",
+                    (chunk_id, lance_id, embedder.s.embed_model),
+                )
+            conn.commit()
+        except Exception:
+            pass  # embedding 失败不阻塞(FTS 路径可用)
+    return n

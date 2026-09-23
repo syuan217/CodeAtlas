@@ -648,8 +648,25 @@ def audit(
                    for schema in parsed_all]
         report = render_report(results)
         persist_findings(conn, results)
+        # 报告入索引(kind=report;FTS+向量,供 atlas ask 引用)
+        from codeatlas.db.lance import LanceStore as _LS
+        from codeatlas.providers.embedding import EmbeddingProvider as _EP
+        from codeatlas.schema.audit import index_report as _index_report
+
+        _lance = _LS(get_settings())
+        _embed = _EP(get_settings(), conn)
+
+        async def _index_and_close():
+            n = await _index_report(conn, _lance, _embed, report, get_settings())
+            await _embed.aclose()
+            return n
+
+        n_rc = asyncio.run(_index_and_close())
         total = sum(len(r.findings) for r in results)
-        console.print(f"\nfindings 共 [bold]{total}[/bold] 条;报告:[green]{report}[/green]")
+        console.print(
+            f"\nfindings 共 [bold]{total}[/bold] 条;报告:[green]{report}[/green]"
+            f"(入库 {n_rc} chunks,可被 atlas ask 引用)"
+        )
         for r in results:
             console.print(
                 f"  {r.schema}: {len(r.findings)} findings"
