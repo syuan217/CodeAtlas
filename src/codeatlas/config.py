@@ -75,7 +75,7 @@ class Settings(BaseSettings):
     embed_api_key: str = ""
     embed_model: str = ""
     embed_dim: int = 1024  # 维度校验用,换模型必须改,防串库
-    embed_batch_size: int = 64
+    embed_batch_size: int = 20  # qwen 兼容端点单批上限 20;OpenAI 系可调大
     embed_query_prefix: str = ""  # 非对称模型可选,如 bge 的 query 前缀
     embed_passage_prefix: str = ""
     embed_price: float | None = None  # 元/1M tokens,覆盖内置表
