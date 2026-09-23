@@ -255,15 +255,14 @@ def test_fill_sheet_roundtrip(tmp_path):
     text = sheet.read_text(encoding="utf-8")
     assert "t_order" in text
     assert "t_tmp_scratch" not in text  # temp/tmp 排除
-    assert "## 慢查询" in text
+    assert "import-slow" in text  # 慢查询走文件通道指引
 
     # 模拟人工填写
     text = text.replace(
         "| t_order |  |  |  |  |  |", "| t_order | 2,300 | 5 | 1 | 90000 | 重点表 |"
     ).replace(
-        "|  |  |  |  |  |  |",
-        "| testdb | SELECT * FROM t_order WHERE id = 1 | 120 | 35 | 8000 | 1 |",
-        1,
+        "# 慢查询不再填本表:请单独导入文件(CSV/JSON/纯文本 SQL 均可):",
+        "# 慢查询不再填本表:请单独导入文件(CSV/JSON/纯文本 SQL 均可):",
     )
     filled = tmp_path / "filled_sheet.md"
     filled.write_text(text, encoding="utf-8")
@@ -272,7 +271,6 @@ def test_fill_sheet_roundtrip(tmp_path):
     data = _json.loads(written[0].read_text(encoding="utf-8"))
     assert data["tables"]["t_order"]["row_count"] == 2300
     assert data["tables"]["t_order"]["data_length"] == 5
-    assert data["slow_queries"][0]["freq"] == 120
 
     conn = connect()
     init_db(conn)
@@ -283,3 +281,69 @@ def test_fill_sheet_roundtrip(tmp_path):
     ).fetchone()
     assert row["row_count"] == 2300 and row["data_length"] == 5
     conn.close()
+
+
+def test_slow_query_import_and_qry101(tmp_path, monkeypatch):
+    """慢查询文件通道:三种格式解析 + QRY101 规则 + 访问路径并入证据。"""
+    from pathlib import Path as P
+
+    from codeatlas.schema.audit import run_audit
+    from codeatlas.schema.collect_ob import import_slow_queries, parse_slow_file
+
+    parsed = {"testdb": parse_ddl("testdb", OB_DDL)}
+
+    # JSON 格式(带统计)
+    jf = tmp_path / "slow.json"
+    jf.write_text(json.dumps([
+        {"schema": "testdb", "sql": "SELECT * FROM t_order WHERE status = 'PAID'",
+         "freq": 500, "avg_ms": 3200, "rows_scanned": 5000000, "rows_returned": 12},
+        {"sql": "SELECT 1", "freq": 1},  # 无法归属(schema 空/表不命中)→ 丢弃
+    ]))
+    rows = parse_slow_file(jf)
+    assert len(rows) == 2 and rows[0]["rows_scanned"] == 5000000
+    counts = import_slow_queries(jf, parsed, out_dir=tmp_path)
+    assert counts == {"testdb": 1}
+    data = json.loads((tmp_path / "testdb_manual.json").read_text())
+    assert data["slow_queries"][0]["freq"] == 500
+
+    # CSV 格式(中文表头)
+    cf = tmp_path / "slow.csv"
+    cf.write_text("库名,sql,频次,平均耗时ms,扫描行数,返回行数\n"
+                  "testdb,\"SELECT id FROM t_order WHERE org_code = 'X'\",80,900,900000,80\n")
+    counts2 = import_slow_queries(cf, parsed, out_dir=tmp_path)
+    assert counts2 == {"testdb": 1}
+    data2 = json.loads((tmp_path / "testdb_manual.json").read_text())
+    assert len(data2["slow_queries"]) == 2  # 合并不覆盖
+
+    # 纯文本 SQL(无统计)
+    tf = tmp_path / "slow.txt"
+    tf.write_text("SELECT * FROM t_no_pk WHERE code = 'a'\n\nSELECT count(*) FROM t_order\n")
+    counts3 = import_slow_queries(tf, parsed, out_dir=tmp_path)
+    assert counts3 == {"testdb": 2}
+
+    # QRY101:ratio>1000 命中
+    from codeatlas.db.models import connect as _c, init_db as _i
+    from codeatlas import config as _cfg
+    monkeypatch.setattr(_cfg, "DB_PATH", tmp_path / "q.sqlite")
+    conn = _c(); _i(conn)
+    persist_ddl(conn, parsed["testdb"])
+    slow = json.loads((tmp_path / "testdb_manual.json").read_text())["slow_queries"]
+    result = run_audit(conn, "testdb", [], [], slow_queries=slow)
+    qry = [f for f in result.findings if f.rule_id == "QRY101"]
+    assert len(qry) == 2  # JSON 条(5e6/12)与 CSV 条(9e5/80=11250)均超线
+    ratios = {f.evidence["ratio"] for f in qry}
+    assert 416666 in ratios and 11250 in ratios
+    assert all(f.evidence["tables"] == ["t_order"] for f in qry)
+    # 无统计条目不进 QRY101
+    assert all(f.rule_id != "QRY101" or f.evidence.get("ratio") for f in result.findings)
+    conn.close()
+
+
+def test_fill_sheet_no_slow_section(tmp_path):
+    """fill_sheet 不再包含慢查询填表段。"""
+    from codeatlas.schema.collect_ob import generate_fill_sheet
+
+    sheet = generate_fill_sheet({"testdb": parse_ddl("testdb", OB_DDL)}, out_dir=tmp_path)
+    text = sheet.read_text(encoding="utf-8")
+    assert "import-slow" in text  # 指引走文件通道
+    assert "| 库名 | SQL |" not in text  # 旧慢查询表格段已移除

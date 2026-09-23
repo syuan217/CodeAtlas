@@ -173,13 +173,8 @@ def generate_fill_sheet(parsed: dict, out_dir: Path | None = None) -> Path:
             lines.append(f"| {tb.name} |  |  |  |  |  |")
         lines.append("")
     lines += [
-        "## 慢查询(可选,所有库共用)",
-        "",
-        "来源:监控平台/OCP/gv$sql_audit 导出;SQL 可截断,频次与耗时尽量填。",
-        "",
-        "| 库名 | SQL | 频次 | 平均耗时ms | 扫描行数 | 返回行数 |",
-        "|---|---|---|---|---|---|",
-        "|  |  |  |  |  |  |",
+        "# 慢查询不再填本表:请单独导入文件(CSV/JSON/纯文本 SQL 均可):",
+        "# uv run atlas collect --import-slow <文件> [--schema 库名]",
     ]
     out = out_dir / "fill_sheet.md"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -207,14 +202,8 @@ def import_fill_sheet(path: Path, parsed: dict, out_dir: Path | None = None) -> 
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) < 2 or set(cells[0]) <= set("-: ") or cells[0] in ("表名", "库"):
             continue
-        if section == "慢查询(可选,所有库共用)":
-            if len(cells) >= 6:
-                slow_rows.append({
-                    "schema": cells[0], "sql": cells[1],
-                    "freq": _num(cells[2]), "avg_ms": _num(cells[3]),
-                    "rows_scanned": _num(cells[4]), "rows_returned": _num(cells[5]),
-                })
-            continue
+        if section and "慢查询" in section:
+            continue  # 已废弃:慢查询走 --import-slow 文件通道
         schema = section
         if schema not in parsed:
             continue
@@ -257,3 +246,111 @@ def _num(v: str):
         return int(f) if f == int(f) else f
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# 慢查询文件导入(CSV / JSON / 纯文本 SQL)
+# ---------------------------------------------------------------------------
+
+def parse_slow_file(path: Path) -> list[dict]:
+    """宽容解析:JSON(数组或 {"slow_queries": [...]})/ CSV(含 sql 列)/
+    纯文本(按空行或行尾分号分条,无统计字段)。"""
+    import csv
+    import re as _re_mod
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    suffix = path.suffix.lower()
+    rows: list[dict] = []
+    if suffix == ".json" or text.lstrip().startswith(("{", "[")):
+        data = json.loads(text)
+        items = data.get("slow_queries") if isinstance(data, dict) else data
+        for it in items or []:
+            rows.append({
+                "schema": it.get("schema"), "sql": it.get("sql") or it.get("query") or "",
+                "freq": _num(str(it.get("freq") or "")),
+                "avg_ms": _num(str(it.get("avg_ms") or it.get("avg_latency_ms") or "")),
+                "rows_scanned": _num(str(it.get("rows_scanned") or "")),
+                "rows_returned": _num(str(it.get("rows_returned") or "")),
+            })
+        return [r for r in rows if r["sql"]]
+    if suffix == ".csv" or ("," in text.splitlines()[0] and "sql" in text.splitlines()[0].lower()):
+        reader = csv.DictReader(text.splitlines())
+        for it in reader:
+            low = {k.strip().lower(): (v or "").strip() for k, v in it.items() if k}
+            if not low.get("sql"):
+                continue
+            rows.append({
+                "schema": low.get("schema") or low.get("库") or low.get("库名"),
+                "sql": low.get("sql"),
+                "freq": _num(low.get("freq") or low.get("频次") or ""),
+                "avg_ms": _num(low.get("avg_ms") or low.get("平均耗时ms") or low.get("耗时ms") or ""),
+                "rows_scanned": _num(low.get("rows_scanned") or low.get("扫描行数") or ""),
+                "rows_returned": _num(low.get("rows_returned") or low.get("返回行数") or ""),
+            })
+        return rows
+    # 纯文本:按空行分条(行尾分号不强求)
+    for block in _re_mod.split(r"\n\s*\n", text):
+        sql = block.strip()
+        if sql and any(k in sql.upper() for k in ("SELECT", "INSERT", "UPDATE", "DELETE")):
+            rows.append({"schema": None, "sql": sql, "freq": None,
+                         "avg_ms": None, "rows_scanned": None, "rows_returned": None})
+    return rows
+
+
+def import_slow_queries(
+    path: Path, parsed: dict, out_dir: Path | None = None,
+    default_schema: str | None = None,
+) -> dict[str, int]:
+    """慢查询文件 → 各库 *_manual.json 的 slow_queries 段(合并去重)。
+
+    库归属:条目 schema 字段 > --schema 参数 > 按 SQL 中表名唯一命中某库。
+    返回 {schema: 导入条数}。
+    """
+    out_dir = out_dir or PROFILES_DIR
+    entries = parse_slow_file(path)
+    # 库表索引:表名 → 命中的库集合
+    tables_by_schema = {
+        s: {t.name for t in p_.tables} for s, p_ in parsed.items()
+    }
+    assigned: dict[str, list[dict]] = {}
+    for e in entries:
+        schema = e.get("schema") or default_schema
+        if not schema:
+            hit = {
+                s for s, tbls in tables_by_schema.items()
+                if any(t.lower() in tbls for t in _sql_tables(e["sql"]))
+            }
+            if len(hit) == 1:
+                schema = next(iter(hit))
+        if not schema:
+            continue  # 无法归属,丢弃(可加 --schema 重导)
+        assigned.setdefault(schema, []).append(e)
+    counts: dict[str, int] = {}
+    for schema, items in assigned.items():
+        if schema not in parsed:
+            continue
+        mp = out_dir / f"{schema}_manual.json"
+        data = json.loads(mp.read_text(encoding="utf-8")) if mp.exists() else {
+            "schema": schema, "tables": {}, "slow_queries": []
+        }
+        seen = {json.dumps(x, sort_keys=True) for x in data.get("slow_queries") or []}
+        for it in items:
+            key = json.dumps(it, sort_keys=True)
+            if key not in seen:
+                data.setdefault("slow_queries", []).append(it)
+                seen.add(key)
+        mp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                      encoding="utf-8")
+        counts[schema] = len(items)
+    return counts
+
+
+def _sql_tables(sql: str) -> set[str]:
+    import re as _re
+
+    try:
+        st = sqlglot.parse_one(sql, dialect="mysql")
+        return {t_.name.lower() for t_ in st.find_all(sqlglot.exp.Table) if t_.name}
+    except Exception:
+        pat = _re.compile(r"(?:FROM|JOIN|INTO|UPDATE)\s+[`]?([a-zA-Z_][a-zA-Z0-9_]*)", _re.I)
+        return {m.lower() for m in pat.findall(sql)}

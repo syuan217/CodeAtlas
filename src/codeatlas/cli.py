@@ -537,15 +537,20 @@ def rebuild_calls(
 def collect(
     schema: str = typer.Option(None, "--schema", help="只处理指定库(缺省=data/ddl 全部)"),
     import_sheet: Path = typer.Option(
-        None, "--import", help="导入已填写的 fill_sheet.md,转为各库 *_manual.json"
+        None, "--import", help="导入已填写的 fill_sheet.md(表规模画像),转为各库 *_manual.json"
+    ),
+    import_slow: Path = typer.Option(
+        None, "--import-slow",
+        help="导入慢查询文件(CSV/JSON/纯文本 SQL;可多次执行合并)",
     ),
 ) -> None:
-    """画像采集(人工模式):生成填报表/只读脚本;--import 导入填好的表。"""
+    """画像采集(人工模式):填报表/只读脚本/慢查询文件三通道。"""
     from codeatlas.config import DDL_DIR, PROFILES_DIR
     from codeatlas.schema.collect_ob import (
         generate_fill_sheet,
         generate_scripts,
         import_fill_sheet,
+        import_slow_queries,
         manual_template,
     )
     from codeatlas.schema.ddl import load_ddl_dir
@@ -555,6 +560,21 @@ def collect(
         console.print(f"[red]{DDL_DIR} 下没有 DDL 文件(.sql/.md)[/red]")
         raise typer.Exit(code=1)
     targets = {schema: parsed_all[schema]} if schema else parsed_all
+
+    if import_slow is not None:
+        if not import_slow.exists():
+            console.print(f"[red]文件不存在:{import_slow}[/red]")
+            raise typer.Exit(code=1)
+        counts = import_slow_queries(
+            import_slow, targets, out_dir=PROFILES_DIR, default_schema=schema
+        )
+        if counts:
+            for s, n in counts.items():
+                console.print(f"慢查询导入:[green]{s}[/green] {n} 条 → {PROFILES_DIR / (s + '_manual.json')}")
+            console.print("[dim]重新运行 atlas audit 即生效(QRY101 + 访问路径证据)。[/dim]")
+        else:
+            console.print("[yellow]没有条目被归属到任何库:检查文件格式,或用 --schema 指定库名。[/yellow]")
+        return
 
     if import_sheet is not None:
         written = import_fill_sheet(import_sheet, targets, out_dir=PROFILES_DIR)
@@ -644,8 +664,83 @@ def audit(
             )
         ]
 
+        # 3.5) 慢查询:入库表画像之外的事件数据(独立文件导入);SQL 的
+        # where/join 列并入访问路径证据(线上真实查询,IDX001 最硬证据)
+        from codeatlas.schema.collect_ob import load_manual
+        from codeatlas.schema.sql_extract import (
+            ExtractedQuery,
+            _clean_dynamic,
+            _extract_accesses,
+            _try_parse,
+            fingerprint_sql,
+        )
+
+        slow_by_schema: dict[str, list[dict]] = {}
+        slow_extra_qmap: list[dict] = []
+        for schema in parsed_all:
+            mp = PROFILES_DIR / f"{schema}_manual.json"
+            if not mp.exists():
+                continue
+            data = load_manual(mp)
+            slow = [q for q in (data.get("slow_queries") or []) if q.get("sql")]
+            slow_by_schema[schema] = slow
+            for q in slow:
+                sql = _clean_dynamic(str(q["sql"]))
+                stmt = _try_parse(sql)
+                if stmt is None:
+                    continue
+                tbls, accesses = _extract_accesses(stmt)
+                if not tbls:
+                    continue
+                eq = ExtractedQuery(
+                    source_file=f"slow_query:{schema}", source_line=0, sql=sql[:2000],
+                    fingerprint=fingerprint_sql(sql), tables=tbls, accesses=accesses,
+                )
+                freq = int(q.get("freq") or 1)
+                for a in eq.accesses:
+                    slow_extra_qmap.append({
+                        "query_fingerprint": eq.fingerprint,
+                        "source_file": eq.source_file, "source_line": 0,
+                        "table_name": a.table, "column_name": a.column,
+                        "usage": a.usage, "freq": freq,
+                    })
+        if slow_extra_qmap:
+            conn.execute(
+                "INSERT INTO repos(name, path, languages) "
+                "VALUES('__codeatlas_reports__', '', '[]') "
+                "ON CONFLICT(name) DO UPDATE SET path=''"
+            )
+            sid = conn.execute(
+                "SELECT id FROM repos WHERE name='__codeatlas_reports__'"
+            ).fetchone()["id"]
+            # key 含 schema(source_file 体现归属);同键取最大频次
+            merged: dict[tuple, int] = {}
+            for r in slow_extra_qmap:
+                schema_k = r["source_file"].split(":", 1)[1]
+                key = (schema_k, r["query_fingerprint"], r["table_name"],
+                       r["column_name"], r["usage"])
+                merged[key] = max(merged.get(key, 0), r["freq"])
+            conn.execute(
+                "DELETE FROM query_column_map WHERE repo_id=? AND source_file LIKE 'slow_query:%'",
+                (sid,),
+            )
+            rows = [
+                (sid, fp, f"slow_query:{schema_k}", 0, tbl, col, usage, freq)
+                for (schema_k, fp, tbl, col, usage), freq in merged.items()
+            ]
+            conn.executemany(
+                "INSERT INTO query_column_map(repo_id, query_fingerprint, source_file, "
+                "source_line, table_name, column_name, usage, freq) VALUES(?,?,?,?,?,?,?,?)",
+                rows,
+            )
+            conn.commit()
+            console.print(f"慢查询证据:{sum(len(v) for v in slow_by_schema.values())} 条,"
+                          f"访问路径 {len(merged)} 条并入")
+        qmap += slow_extra_qmap
+
         # 4) 规则引擎 + 报告
-        results = [run_audit(conn, schema, qmap, anti_patterns)
+        results = [run_audit(conn, schema, qmap, anti_patterns,
+                             slow_queries=slow_by_schema.get(schema))
                    for schema in parsed_all]
         report = render_report(results)
         persist_findings(conn, results)

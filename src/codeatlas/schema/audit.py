@@ -317,6 +317,7 @@ def run_audit(
     schema: str,
     qmap: list[dict],
     anti_patterns: list[dict],
+    slow_queries: list[dict] | None = None,
 ) -> AuditResult:
     tables = _load_tables(conn, schema)
     excluded = [
@@ -339,18 +340,58 @@ def run_audit(
     result.findings += rule_idx004(qmap, tables)
     result.findings += rule_idx005(anti_patterns)
 
-    # 画像类规则(有画像才跑;v1 实现 IDX101,IDX102/103/QRY101 需列级/慢查画像)
+    # 慢查询类(QRY101):有统计条目才跑
+    slow = [q for q in (slow_queries or []) if q.get("rows_scanned") and q.get("rows_returned")]
+    if slow:
+        result.findings += _rule_qry101(schema, slow)
+    else:
+        result.unavailable.append("QRY101")
+
+    # 画像类规则
     profiled = [t for t in tables.values() if t.has_profile]
     if not profiled:
-        result.unavailable += ["IDX101", "IDX102", "IDX103", "QRY101"]
+        result.unavailable += ["IDX101", "IDX102", "IDX103"]
     else:
         result.findings += _rule_idx101(tables)
         col_stats_ready = conn.execute(
             "SELECT COUNT(*) AS c FROM ddl_columns WHERE cardinality IS NOT NULL"
         ).fetchone()["c"]
         if col_stats_ready == 0:
-            result.unavailable += ["IDX102", "IDX103", "QRY101"]
+            result.unavailable += ["IDX102", "IDX103"]
     return result
+
+
+def _rule_qry101(schema: str, slow: list[dict]) -> list[Finding]:
+    """扫描/返回行数比 >1000(PLAN §9.8)。"""
+    out = []
+    from codeatlas.schema.collect_ob import _sql_tables
+
+    for q in slow:
+        try:
+            ratio = float(q["rows_scanned"]) / max(1.0, float(q["rows_returned"]))
+        except (TypeError, ValueError):
+            continue
+        if ratio > 1000:
+            tables_hit = sorted(_sql_tables(q.get("sql") or ""))[:3]
+            out.append(
+                Finding(
+                    table=tables_hit[0] if tables_hit else "(多表)",
+                    rule_id="QRY101", severity="high" if ratio > 10000 else "medium",
+                    evidence={
+                        "sql": (q.get("sql") or "")[:200],
+                        "freq": q.get("freq"), "avg_ms": q.get("avg_ms"),
+                        "rows_scanned": q.get("rows_scanned"),
+                        "rows_returned": q.get("rows_returned"),
+                        "ratio": int(ratio),
+                        "tables": tables_hit,
+                    },
+                    suggestion=(
+                        f"扫描/返回比 {int(ratio)}:1,典型缺索引或索引未命中;"
+                        f"结合 IDX001 的条件列建议核查该 SQL 的 where/join 列。"
+                    ),
+                )
+            )
+    return out
 
 
 def _rule_idx101(tables: dict[str, Tbl]) -> list[Finding]:
