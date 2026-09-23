@@ -736,6 +736,33 @@ def wiki(
     asyncio.run(_wiki(repo, concise, max_pages, force))
 
 
+@app.command("index-docs")
+def index_docs_cmd() -> None:
+    """data/docs 人工文档入库(kind=doc,重跑自动替换;之后 atlas ask 可引用)。"""
+    from codeatlas.config import DOCS_DIR
+    from codeatlas.db.lance import LanceStore
+    from codeatlas.schema.audit import index_docs
+
+    s = get_settings()
+    conn = connect()
+    init_db(conn)
+    embedder = EmbeddingProvider(s, conn)
+    lance = LanceStore(s)
+
+    async def _run():
+        n = await index_docs(conn, lance, embedder, DOCS_DIR, s)
+        await embedder.aclose()
+        return n
+
+    try:
+        n = asyncio.run(_run())
+        console.print(f"docs 入库 {n} chunks(目录:{DOCS_DIR};README.md 已跳过)")
+        if n == 0:
+            console.print("[yellow]目录为空:把 markdown 文档放进去后再跑。[/yellow]")
+    finally:
+        conn.close()
+
+
 @app.command()
 def doctor() -> None:
     """连通性体检:两个端点各一次最小调用,打印模型/维度/费用。"""

@@ -494,3 +494,59 @@ async def index_report(conn, lance, embedder, report_path, settings) -> int:
         except Exception:
             pass  # embedding 失败不阻塞(FTS 路径可用)
     return n
+
+
+async def index_docs(conn, lance, embedder, docs_dir, settings) -> int:
+    """data/docs 人工文档入库(PLAN §6:人工维护文档与 wiki 一起入索引)。
+
+    kind=doc、哨兵 repo 行 '__codeatlas_docs__' 承载外键;重跑自动替换。
+    """
+    from pathlib import Path as _P
+
+    from codeatlas.db.fts import fts_delete
+    from codeatlas.ingest.chunker import chunk_markdown
+
+    conn.execute(
+        "INSERT INTO repos(name, path, languages) VALUES('__codeatlas_docs__', '', '[]') "
+        "ON CONFLICT(name) DO UPDATE SET path=''"
+    )
+    repo_id = conn.execute(
+        "SELECT id FROM repos WHERE name='__codeatlas_docs__'"
+    ).fetchone()["id"]
+    old = conn.execute(
+        "SELECT id, content FROM chunks WHERE repo_id=? AND kind='doc'", (repo_id,)
+    ).fetchall()
+    for r in old:
+        fts_delete(conn, r["id"], r["content"])
+    conn.execute("DELETE FROM chunks WHERE repo_id=? AND kind='doc'", (repo_id,))
+    conn.commit()
+
+    n = 0
+    pending = []
+    for page in sorted(_P(docs_dir).rglob("*.md")):
+        if page.name == "README.md":
+            continue
+        text = page.read_text(encoding="utf-8", errors="replace")
+        for ch in chunk_markdown(text, settings.chunk_max_tokens):
+            cur = conn.execute(
+                "INSERT INTO chunks(repo_id, kind, title, content, content_hash, "
+                "line_start, line_end) VALUES(?,?,?,?,?,?,?)",
+                (repo_id, "doc", f"docs:{page.relative_to(docs_dir)}:{ch.title or ''}",
+                 ch.content, ch.content_hash, ch.line_start, ch.line_end),
+            )
+            pending.append((cur.lastrowid, ch.content))
+            n += 1
+    conn.commit()
+    if embedder is not None and pending:
+        try:
+            vectors = await embedder.embed([c for _, c in pending], stage="index")
+            rows = [(cid, repo_id, "doc", b) for (cid, _), b in zip(pending, vectors)]
+            for lance_id, chunk_id in lance.add_vectors(rows):
+                conn.execute(
+                    "INSERT INTO vector_refs(chunk_id, lance_id, model) VALUES(?,?,?)",
+                    (chunk_id, lance_id, embedder.s.embed_model),
+                )
+            conn.commit()
+        except Exception:
+            pass
+    return n
