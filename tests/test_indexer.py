@@ -361,7 +361,8 @@ def test_duplicate_chunks_within_file_deduped(env, tmp_path):
     """同文件内完全重复的内容块(md 重复段落)不得撞 idx_chunks_dedup。"""
     root = tmp_path / "repo"
     root.mkdir()
-    dup = "# T\n\n## A\n\nsame line\n\n## A\n\nsame line\n"  # 两节完全相同(重复标题+内容)
+    dup = ("# T" + chr(10) * 2 + "## A" + chr(10) * 2 + "same line" + chr(10) * 2
+            + "## A" + chr(10) * 2 + "same line" + chr(10) * 2 + "## Z")  # 中间两块完全相同
     (root / "dup.md").write_text(dup)
     repo = RepoCfg(name="dup", path=root)
     stats = env.run(repo)
