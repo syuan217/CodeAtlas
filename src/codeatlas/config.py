@@ -14,14 +14,34 @@ import yaml
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 包内模板目录(wheel 安装后仍在包内,用于首次初始化)
+TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
-ENV_FILE = PROJECT_ROOT / ".env"
-REPOS_YAML = PROJECT_ROOT / "repos.yaml"
+
+def _resolve_home() -> Path:
+    """工作目录解析(安装分发支持):
+
+    1) 环境变量 CODEATLAS_HOME(显式指定);
+    2) 当前目录存在 .env 或 repos.yaml(源码检出/项目目录运行——向后兼容);
+    3) ~/.codeatlas(wheel/pipx 安装后的默认)。
+    """
+    env = os.environ.get("CODEATLAS_HOME")
+    if env:
+        return Path(env).expanduser()
+    cwd = Path.cwd()
+    if (cwd / ".env").exists() or (cwd / "repos.yaml").exists():
+        return cwd
+    return Path.home() / ".codeatlas"
+
+
+CODEATLAS_HOME = _resolve_home()
+
+ENV_FILE = CODEATLAS_HOME / ".env"
+REPOS_YAML = CODEATLAS_HOME / "repos.yaml"
 
 
 def _resolve_data_dir() -> Path:
-    """DATA_DIR 可配置:shell 环境变量 > .env 中 DATA_DIR 行 > 默认 项目内 data/。
+    """DATA_DIR 可配置:shell 环境变量 > .env 中 DATA_DIR 行 > 默认 <HOME>/data。
 
     只解析 .env 里的 DATA_DIR 单键,不用 load_dotenv 整体加载——
     避免把服务商 key 灌进 os.environ,破坏测试与进程隔离。
@@ -40,7 +60,7 @@ def _resolve_data_dir() -> Path:
                     break
         except OSError:
             pass
-    return Path(val) if val else PROJECT_ROOT / "data"
+    return Path(val) if val else CODEATLAS_HOME / "data"
 
 
 # 运行时目录(整体 gitignore,见 PLAN §6/§13)
@@ -174,9 +194,19 @@ _DOCS_README = """# data/docs —— 人工维护文档目录
 
 
 def ensure_dirs() -> None:
-    """创建运行时目录;首次创建时在 data/docs/ 放说明。"""
+    """创建运行时目录;首次使用时落盘配置模板(.env.example / repos 示例)。"""
+    CODEATLAS_HOME.mkdir(parents=True, exist_ok=True)
     for d in (DATA_DIR, LANCEDB_DIR, WIKI_DIR, DOCS_DIR, PROFILES_DIR, REPORTS_DIR, DDL_DIR):
         d.mkdir(parents=True, exist_ok=True)
+    for tmpl, target in (
+        ("env.example", CODEATLAS_HOME / ".env.example"),
+        ("repos.example.yaml", CODEATLAS_HOME / "repos.example.yaml"),
+    ):
+        dst = target
+        if not dst.exists():
+            src = TEMPLATE_DIR / tmpl
+            if src.exists():
+                dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     readme = DOCS_DIR / "README.md"
     if not readme.exists():
         readme.write_text(_DOCS_README, encoding="utf-8")

@@ -1,0 +1,12 @@
+# 仓库清单(atlas index 的输入)。首次使用请把此文件改名为 repos.yaml 并填写。
+# name:       唯一标识,CLI 里用
+# path:       本地绝对路径
+# languages:  信息性说明(索引实际按文件扩展名识别语言)
+# exclude:    在仓库 .gitignore 之上的额外排除
+repos: []
+# repos:
+#   - name: my-service
+#     path: /Users/you/code/my-service
+#     languages: [java, xml]
+#     exclude:
+#       - "**/target/"

@@ -37,6 +37,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/codeatlas"]
 
+# 包内非 .py 资源:wiki prompts 与配置模板
+[tool.hatch.build]
+artifacts = [
+    "src/codeatlas/gencode/prompts/*.md",
+    "src/codeatlas/templates/*",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

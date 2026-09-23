@@ -16,7 +16,7 @@ def test_data_dir_default_and_env_override(monkeypatch, tmp_path):
     # 隔离真实 .env(用户可能配置了 DATA_DIR 外置目录)
     monkeypatch.delenv("DATA_DIR", raising=False)
     monkeypatch.setattr(config, "ENV_FILE", tmp_path / "no.env")
-    assert config._resolve_data_dir() == config.PROJECT_ROOT / "data"
+    assert config._resolve_data_dir() == config.CODEATLAS_HOME / "data"
     # shell 环境变量优先
     monkeypatch.setenv("DATA_DIR", "/tmp/custom-data")
     assert config._resolve_data_dir() == Path("/tmp/custom-data")
