@@ -144,7 +144,7 @@ async def _doctor() -> None:
     try:
         r = await llm.chat(
             [{"role": "user", "content": "ping"}], stage="doctor",
-            max_tokens=64, thinking_disabled=True,
+            max_tokens=256, thinking_disabled=True,
         )
         llm_ms = (time.perf_counter() - t0) * 1000
         llm_line = (
