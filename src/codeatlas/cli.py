@@ -818,58 +818,75 @@ def audit(
         conn.close()
 
 
-async def _wiki(repo_name: str, concise: bool, max_pages: int | None, force: bool) -> None:
-    from codeatlas.config import load_repos
+async def _wiki_one(cfg, concise: bool, max_pages: int | None) -> bool:
+    """生成单个仓库的 wiki;返回是否成功。"""
     from codeatlas.db.lance import LanceStore
     from codeatlas.gencode.wiki import generate_wiki
 
-    repos = [r for r in load_repos() if r.name == repo_name]
-    if not repos:
-        console.print(f"[red]repos.yaml 里没有 {repo_name!r}[/red]")
-        raise typer.Exit(code=1)
-    cfg = repos[0]
     s = get_settings()
     conn = connect()
     init_db(conn)
     repo_id = conn.execute(
-        "SELECT id FROM repos WHERE name=?", (repo_name,)
+        "SELECT id FROM repos WHERE name=?", (cfg.name,)
     ).fetchone()
     if repo_id is None or not conn.execute(
         "SELECT COUNT(*) AS c FROM files WHERE repo_id=? AND parse_status='ok'",
         (repo_id["id"],),
     ).fetchone()["c"]:
-        console.print(f"[red]{repo_name} 尚未索引,先运行 atlas index --repo {repo_name}[/red]")
+        console.print(f"[yellow]{cfg.name} 尚未索引,跳过(先 atlas index --repo {cfg.name})[/yellow]")
         conn.close()
-        raise typer.Exit(code=1)
+        return False
 
     lance = LanceStore(s)
     llm = LLMProvider(s, conn)
     embedder = EmbeddingProvider(s, conn)
     try:
-        with console.status("[bold]wiki 生成中…[/bold]"):
+        with console.status(f"[bold]wiki 生成中:{cfg.name}…[/bold]"):
             stats = await generate_wiki(
                 cfg, conn, llm, s, lance, embedder,
                 concise=concise, max_pages=max_pages,
             )
         console.print(
-            f"模块 {stats.modules} → 页面 {stats.pages_planned}(成功 {stats.pages_generated},"
-            f"失败 {stats.pages_failed})\n引用:{stats.citations_ok}/{stats.citations_total}"
-            f"通过,剔除 {stats.citations_removed}\n输出:{stats.output_dir}\n"
-            f"入库 chunks(kind=wiki):{stats.indexed_chunks}"
+            f"{cfg.name}:模块 {stats.modules} → 页面 {stats.pages_planned}"
+            f"(成功 {stats.pages_generated},失败 {stats.pages_failed}) · "
+            f"引用 {stats.citations_ok}/{stats.citations_total} 通过,"
+            f"剔除 {stats.citations_removed} · 入库 {stats.indexed_chunks} chunks"
+            f" · 输出 {stats.output_dir}"
         )
         for e in stats.errors:
             console.print(f"[yellow]{e}[/yellow]")
-        console.print("[dim]冷启动评审:阅读各页 front-matter 的 metrics 与正文质量,"
-                      "反馈后我调 prompts/ 升版本。[/dim]")
+        return True
+    except Exception as e:
+        console.print(f"[red]{cfg.name} wiki 生成失败:{e}[/red]")
+        return False
     finally:
         await llm.aclose()
         await embedder.aclose()
         conn.close()
 
 
+async def _wiki(repo_name: str | None, concise: bool, max_pages: int | None, force: bool) -> None:
+    from codeatlas.config import load_repos
+
+    all_repos = load_repos()
+    if repo_name:
+        repos = [r for r in all_repos if r.name == repo_name]
+        if not repos:
+            console.print(f"[red]repos.yaml 里没有 {repo_name!r}[/red]")
+            raise typer.Exit(code=1)
+    else:
+        repos = all_repos
+        console.print(f"未指定 --repo,遍历 repos.yaml({len(repos)} 个)逐个生成")
+    ok = 0
+    for cfg in repos:
+        if await _wiki_one(cfg, concise, max_pages):
+            ok += 1
+    console.print(f"\n完成:{ok}/{len(repos)} 个仓库。冷启动评审:阅读各页 front-matter 的 metrics。")
+
+
 @app.command()
 def wiki(
-    repo: str = typer.Argument(..., help="仓库名(repos.yaml)"),
+    repo: str = typer.Argument(None, help="仓库名(缺省 = repos.yaml 全部,已索引的逐个生成)"),
     concise: bool = typer.Option(False, "--concise", help="4~6 页精简模式(冷启动推荐)"),
     max_pages: int = typer.Option(None, "--max-pages", help="限制生成页数(冷启动试跑)"),
     force: bool = typer.Option(False, "--force", help="强制重生成(人工保护仍然生效)"),
