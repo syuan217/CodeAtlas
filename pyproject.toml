@@ -2,7 +2,7 @@
 name = "codeatlas"
 version = "0.1.0"
 description = "本地代码知识库 RAG:语义问答 / 结构查询 / wiki 生成 / OceanBase 索引体检"
-readme = "PLAN.md"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "typer>=0.12",
