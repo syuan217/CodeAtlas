@@ -137,7 +137,6 @@ atlas collect --import-slow <新慢查询文件> && atlas audit   # 体检材料
 uv sync && uv run pytest        # 180 个测试(网络层全部 mock)
 ```
 
-- 设计施工文档 PLAN.md 与体检输入登记 M4_INPUTS.md 为本地维护的过程文档,不入库;
 - wiki prompt 版本化于 `src/codeatlas/gencode/prompts/`(改动须升版本);
 - 里程碑:M0 脚手架 → M1 索引管线 → M2 融合检索 → M3 调用边(验收 100%)→ M4 OB 体检 → M5 wiki 生成 → M6 agent 问答。
 
