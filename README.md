@@ -7,6 +7,7 @@
 | 能力 | 命令 | 说明 |
 |---|---|---|
 | **语义问答** | `atlas ask "问题"` | 带着真实的 `文件:行号` 引用回答代码问题;代码、wiki、体检报告、人工文档一起参与检索 |
+| **代码检索** | `atlas search "关键词"` | 零 LLM 的融合检索(向量+全文+符号),直接输出 文件:行号 命中列表;无任何 API 配置也可用 |
 | **结构查询** | `atlas callers / callees / definition / impact` | 确定性调用链查询(谁调用了 X / 改 X 影响哪里),不经过 LLM,结果 100% 可信 |
 | **Agent 问答** | `atlas agent "问题"` | LLM 自主调用检索/调用链/读文件工具,多轮收集证据后作答(适合多跳问题) |
 | **wiki 文档** | `atlas wiki <repo>` | 生成 zread 风格的代码导读(章节目录/面包屑/上下页导航,行内引用可点击跳转源码) |
@@ -27,15 +28,7 @@ uv sync                     # 自动锁 Python 3.12 + 全部依赖
 uv tool install --editable .   # 可选:获得全局 atlas 命令(否则用 uv run atlas …)
 ```
 
-### 方式二:wheel / 私有 PyPI(使用者)
-
-```bash
-uv tool install codeatlas           # 已发布到 PyPI 时
-# 或本地 wheel:
-uv tool install codeatlas-0.1.0-py3-none-any.whl
-```
-
-### 方式三:离线安装包(内网,零网络)
+### 方式二:离线安装包(内网,零网络,免源码)
 
 ```bash
 # 构建侧:产物为单 zip(含主包 + 全部依赖 wheel + INSTALL.md)
@@ -47,6 +40,13 @@ uv tool install --offline --find-links ./wheels codeatlas
 ```
 
 ## 快速开始
+
+两种起步姿势任选:
+
+- **零门槛试用**(不配任何 API,本地检索/调用链即可用):跳过下面第 1 步,直接
+  `atlas index --no-embed` → `atlas search "关键词"` / `atlas callers <符号>`;
+  之后想用问答,再补 `.env` 配置并 `atlas index --full` 补嵌向量(数据全复用);
+- **完整能力**(问答/wiki):按下面 1-4 步。
 
 ```bash
 # 1) 配置:首次运行任意命令会在 ~/.codeatlas 生成模板
@@ -75,7 +75,7 @@ atlas wiki my-service            # 生成代码导读(data/wiki/<repo>/README.md
 
 | 命令 | 说明 |
 |---|---|
-| `atlas index [--repo N] [--full]` | 索引 repos.yaml 仓库(遍历→符号→切块→FTS→向量);`--full` 强制全量重解析 |
+| `atlas index [--repo N] [--full] [--no-embed]` | 索引 repos.yaml 仓库(遍历→符号→切块→FTS→向量);`--full` 全量重解析;`--no-embed` 纯本地索引(零 API 费用) |
 | `atlas rebuild-calls [--repo N]` | 重算全库调用边(不动向量,零嵌入费) |
 | `atlas repair-vectors` | 修复向量表(消重复/孤儿行) |
 | `atlas index-docs` | `~/.codeatlas/data/docs/` 人工文档入库(ask 可引用) |
@@ -85,6 +85,7 @@ atlas wiki my-service            # 生成代码导读(data/wiki/<repo>/README.md
 | 命令 | 说明 |
 |---|---|
 | `atlas ask "问题" [--repo N]` | 单轮融合检索问答(向量+FTS+符号+图扩展) |
+| `atlas search "关键词" [--repo N] [-k 10] [--no-vector]` | 零 LLM 检索:直接输出 文件:行号 命中列表 |
 | `atlas agent "问题" [--repo N] [--max-turns 6]` | 工具循环问答(检索/调用链/读文件,多跳问题) |
 | `atlas definition / callers / callees <符号>` | 符号定义 / 调用方 / 被调方 |
 | `atlas impact <符号> [--depth N]` | 影响面(沿调用链向上传播) |
