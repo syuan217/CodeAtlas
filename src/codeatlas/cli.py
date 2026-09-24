@@ -44,7 +44,7 @@ console = Console()
 
 
 @app.command()
-def status() -> None:
+def status(as_json: bool = typer.Option(False, "--json", help="输出 JSON(Agent 消费)")) -> None:
     """库状态:schema 版本、repos、各类对象计数、数据目录。"""
     ensure_dirs()
     conn = connect()
@@ -57,6 +57,17 @@ def status() -> None:
         schema_version = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'"
         ).fetchone()["value"]
+        if as_json:
+            repos_rows = [dict(r) for r in conn.execute(
+                r"SELECT name, indexed_commit, last_indexed_at FROM repos "
+                r"WHERE name NOT LIKE '\_\_%' ESCAPE '\' ORDER BY id")]
+            _emit_json({
+                "db": str(DB_PATH), "schema_version": schema_version,
+                "counts": counts, "repos": repos_rows,
+                "total_cost": total_cost(conn),
+            })
+            conn.close()
+            return
 
         table_out = Table(title="codeatlas status", show_header=False)
         table_out.add_column(style="bold cyan")
@@ -72,7 +83,8 @@ def status() -> None:
         console.print(table_out)
 
         repo_rows = conn.execute(
-            "SELECT name, indexed_commit, last_indexed_at FROM repos ORDER BY id"
+            r"SELECT name, indexed_commit, last_indexed_at FROM repos "
+            r"WHERE name NOT LIKE '\_\_%' ESCAPE '\' ORDER BY id"
         ).fetchall()
         if repo_rows:
             rt = Table(title="repos")
@@ -259,6 +271,12 @@ def repair_vectors() -> None:
         conn.close()
 
 
+def _emit_json(data) -> None:
+    import json as _json
+
+    console.print_json(_json.dumps(data, ensure_ascii=False, default=str))
+
+
 QA_SYSTEM_PROMPT = (
     "你是代码库问答助手。只基于 <context> 标签内提供的代码片段回答问题;"
     "引用代码时使用格式 [相对路径:起始行-结束行](行号必须来自片段开头的 [lines A-B] 标注,"
@@ -392,12 +410,17 @@ def _print_call_edges(edges, title: str) -> None:
 def definition(
     symbol: str = typer.Argument(..., help="符号名或 qualified_name"),
     repo: str = typer.Option(None, "--repo"),
+    as_json: bool = typer.Option(False, "--json", help="输出 JSON(Agent 消费)"),
 ) -> None:
     """查看符号定义位置(文件:行)。"""
     conn = connect()
     try:
         init_db(conn)
         sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
+        if as_json:
+            _emit_json({k: sym[k] for k in
+                        ("qualified_name", "kind", "fpath", "line_start", "line_end", "signature")})
+            return
         console.print(
             f"[green]{sym['qualified_name']}[/green]  {sym['kind']}\n"
             f"  位置:{sym['fpath']}:{sym['line_start']}-{sym['line_end']}\n"
@@ -411,13 +434,19 @@ def definition(
 def callers_cmd(
     symbol: str = typer.Argument(...),
     repo: str = typer.Option(None, "--repo"),
+    as_json: bool = typer.Option(False, "--json", help="输出 JSON(Agent 消费)"),
 ) -> None:
     """谁调用了这个符号(沿 CALLS 入边)。"""
     conn = connect()
     try:
         init_db(conn)
         sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
-        _print_call_edges(callers_of(conn, sym), f"callers of {sym['qualified_name']}")
+        edges = callers_of(conn, sym)
+        if as_json:
+            _emit_json({"symbol": sym["qualified_name"],
+                        "edges": [e.__dict__ for e in edges]})
+            return
+        _print_call_edges(edges, f"callers of {sym['qualified_name']}")
     finally:
         conn.close()
 
@@ -426,13 +455,19 @@ def callers_cmd(
 def callees_cmd(
     symbol: str = typer.Argument(...),
     repo: str = typer.Option(None, "--repo"),
+    as_json: bool = typer.Option(False, "--json", help="输出 JSON(Agent 消费)"),
 ) -> None:
     """这个符号调用了谁(沿 CALLS 出边)。"""
     conn = connect()
     try:
         init_db(conn)
         sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
-        _print_call_edges(callees_of(conn, sym), f"callees of {sym['qualified_name']}")
+        edges = callees_of(conn, sym)
+        if as_json:
+            _emit_json({"symbol": sym["qualified_name"],
+                        "edges": [e.__dict__ for e in edges]})
+            return
+        _print_call_edges(edges, f"callees of {sym['qualified_name']}")
     finally:
         conn.close()
 
@@ -442,6 +477,7 @@ def impact(
     symbol: str = typer.Argument(...),
     repo: str = typer.Option(None, "--repo"),
     depth: int = typer.Option(10, "--depth", help="最大传播深度"),
+    as_json: bool = typer.Option(False, "--json", help="输出 JSON(Agent 消费)"),
 ) -> None:
     """影响面:改这个符号会波及哪些方法(沿 CALLS 入边传播到不动点)。"""
     conn = connect()
@@ -449,6 +485,9 @@ def impact(
         init_db(conn)
         sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
         rows = impact_of(conn, sym, max_depth=depth)
+        if as_json:
+            _emit_json({"symbol": sym["qualified_name"], "impacts": rows})
+            return
         t = Table(title=f"impact of {sym['qualified_name']}")
         for col in ("深度", "受影响符号", "文件"):
             t.add_column(col)
@@ -926,6 +965,7 @@ def search_cmd(
     repo: str = typer.Option(None, "--repo", help="限定仓库"),
     top_k: int = typer.Option(10, "-k", help="返回条数"),
     no_vector: bool = typer.Option(False, "--no-vector", help="跳过向量路(纯 FTS+符号)"),
+    as_json: bool = typer.Option(False, "--json", help="输出 JSON(Agent 消费)"),
 ) -> None:
     """检索(零 LLM):返回相关代码/文档片段与符号位置,不生成回答。"""
     from codeatlas.db.lance import LanceStore
@@ -957,6 +997,32 @@ def search_cmd(
                     await embedder.aclose()
 
         cands = asyncio.run(_run())
+        if as_json:
+            ph = ",".join("?" * min(len(cands), top_k))
+            info = {
+                r["id"]: r for r in conn.execute(
+                    f"SELECT c.id, c.title, c.line_start, c.line_end, c.kind, "
+                    f"       f.path AS fpath FROM chunks c "
+                    f"LEFT JOIN files f ON c.file_id=f.id WHERE c.id IN ({ph})",
+                    [c.chunk_id for c in cands[:top_k]],
+                )
+            }
+            out = []
+            for i, cand in enumerate(cands[:top_k], 1):
+                r = info.get(cand.chunk_id)
+                if r is None:
+                    continue
+                out.append({
+                    "rank": i,
+                    "path": r["fpath"] or f"wiki:{r['title']}",
+                    "line_start": r["line_start"], "line_end": r["line_end"],
+                    "title": r["title"], "kind": r["kind"],
+                    "score": round(cand.score, 4),
+                    "vec_sim": round(cand.vec_sim, 4) if cand.vec_sim is not None else None,
+                    "sources": sorted(cand.sources),
+                })
+            _emit_json({"query": query, "total": len(cands), "results": out})
+            return
         if not cands:
             console.print("[yellow]无命中。[/yellow]")
             return

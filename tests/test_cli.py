@@ -122,3 +122,15 @@ def test_doctor_with_mock_endpoints(isolated_db, monkeypatch, settings):
     # 两条费用流水落库
     stages = {r["stage"] for r in isolated_db.execute("SELECT stage FROM usage_log")}
     assert stages == {"doctor"}
+
+
+def test_json_outputs(isolated_db):
+    """--json 输出(Agent/Skill 消费):合法 JSON 且无表格装饰。"""
+    import json as _json
+
+    r = runner.invoke(cli_mod.app, ["status", "--json"])
+    assert r.exit_code == 0
+    data = _json.loads(r.output)
+    assert data["schema_version"] == "1"
+    assert "counts" in data and "repos" in data
+    assert "┌" not in r.output  # 无表格框线
