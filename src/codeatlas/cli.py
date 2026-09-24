@@ -1085,6 +1085,32 @@ def agent(
 
 
 @app.command()
+def update(
+    concise: bool = typer.Option(False, "--concise", help="wiki 用 4~6 页精简模式"),
+    no_wiki: bool = typer.Option(False, "--no-wiki", help="只做 index,不生成 wiki"),
+) -> None:
+    """代码更新后的一条龙:index(全部仓库增量)→ wiki(全部已索引仓库)。
+
+    串联执行(index 成功才跑 wiki);两者写同一库,不可并行,本命令内部顺序处理。
+    """
+    import subprocess
+    import sys
+
+    def run_stage(args: list[str]) -> None:
+        r = subprocess.run([sys.executable, "-m", "codeatlas", *args])
+        if r.returncode != 0:
+            raise typer.Exit(code=r.returncode)
+
+    console.rule("update · index")
+    run_stage(["index"])
+    if no_wiki:
+        console.print("[dim]--no-wiki:跳过 wiki。[/dim]")
+        return
+    console.rule("update · wiki")
+    run_stage(["wiki"] + (["--concise"] if concise else []))
+
+
+@app.command()
 def doctor() -> None:
     """连通性体检:两个端点各一次最小调用,打印模型/维度/费用。"""
     asyncio.run(_doctor())
