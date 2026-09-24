@@ -14,12 +14,14 @@ from codeatlas.config import (
 
 def test_data_dir_default_and_env_override(monkeypatch, tmp_path):
     # 隔离真实 .env(用户可能配置了 DATA_DIR 外置目录)
-    monkeypatch.delenv("DATA_DIR", raising=False)
+    monkeypatch.setenv("DATA_DIR", "/tmp/custom-data")  # shell env 不生效
     monkeypatch.setattr(config, "ENV_FILE", tmp_path / "no.env")
     assert config._resolve_data_dir() == config.CODEATLAS_HOME / "data"
-    # shell 环境变量优先
-    monkeypatch.setenv("DATA_DIR", "/tmp/custom-data")
-    assert config._resolve_data_dir() == Path("/tmp/custom-data")
+    # .env 行生效
+    env = tmp_path / ".env3"
+    env.write_text("DATA_DIR=/tmp/from-dotenv\n", encoding="utf-8")
+    monkeypatch.setattr(config, "ENV_FILE", env)
+    assert config._resolve_data_dir() == Path("/tmp/from-dotenv")
 
 
 def test_data_dir_reads_env_file_single_key(monkeypatch, tmp_path):
@@ -38,11 +40,12 @@ def test_data_dir_reads_env_file_single_key(monkeypatch, tmp_path):
 
 
 def test_data_dir_env_var_beats_env_file(monkeypatch, tmp_path):
+    """shell 环境变量不再参与路径解析(仅 .env 生效)。"""
     monkeypatch.setenv("DATA_DIR", "/tmp/from-shell")
     env = tmp_path / ".env"
     env.write_text("DATA_DIR=/tmp/from-dotenv\n", encoding="utf-8")
     monkeypatch.setattr(config, "ENV_FILE", env)
-    assert config._resolve_data_dir() == Path("/tmp/from-shell")
+    assert config._resolve_data_dir() == Path("/tmp/from-dotenv")
 
 
 def test_key_defaults_isolated_from_env_file():
@@ -137,22 +140,16 @@ def test_ensure_dirs_creates_layout(tmp_path, monkeypatch):
 
 
 def test_repos_yaml_resolution(monkeypatch, tmp_path):
-    """REPOS_YAML:shell env > .env 行 > 默认 <HOME>/repos.yaml。"""
+    """REPOS_YAML 仅 .env 行可配;shell 环境变量不生效(唯一 env 入口是 CODEATLAS_HOME)。"""
     from codeatlas import config as cfg
 
-    monkeypatch.delenv("REPOS_YAML", raising=False)
-    monkeypatch.delenv("CODEATLAS_HOME", raising=False)
+    monkeypatch.setenv("REPOS_YAML", "/from/shell.yaml")  # 设置了也不生效
     monkeypatch.setattr(cfg, "ENV_FILE", tmp_path / "no.env")
-    # 默认
-    assert cfg._resolve_repos_yaml() == cfg.CODEATLAS_HOME / "repos.yaml"
-    # .env 行
+    assert cfg._resolve_repos_yaml() == cfg.CODEATLAS_HOME / "repos.yaml"  # 默认
     env = tmp_path / ".env2"
     env.write_text("REPOS_YAML=/custom/path/repos.yaml\n", encoding="utf-8")
     monkeypatch.setattr(cfg, "ENV_FILE", env)
-    assert cfg._resolve_repos_yaml() == Path("/custom/path/repos.yaml")
-    # shell env 优先
-    monkeypatch.setenv("REPOS_YAML", "/from/shell.yaml")
-    assert cfg._resolve_repos_yaml() == Path("/from/shell.yaml")
+    assert cfg._resolve_repos_yaml() == Path("/custom/path/repos.yaml")  # .env 行生效
 
 
 def test_home_universal_dir(monkeypatch):

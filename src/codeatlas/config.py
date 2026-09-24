@@ -53,9 +53,8 @@ def _lookup_env_key(key: str) -> str | None:
 
 
 def _resolve_repos_yaml() -> Path:
-    """repos.yaml 位置:shell 环境变量 REPOS_YAML > .env 中 REPOS_YAML 行 >
-    默认 <HOME>/repos.yaml。"""
-    val = os.environ.get("REPOS_YAML") or _lookup_env_key("REPOS_YAML")
+    """repos.yaml 位置仅在 .env 中配置(REPOS_YAML 行)> 默认 <HOME>/repos.yaml。"""
+    val = _lookup_env_key("REPOS_YAML")
     return Path(val).expanduser() if val else CODEATLAS_HOME / "repos.yaml"
 
 
@@ -63,13 +62,12 @@ REPOS_YAML = _resolve_repos_yaml()
 
 
 def _resolve_data_dir() -> Path:
-    """DATA_DIR 可配置:shell 环境变量 > .env 中 DATA_DIR 行 > 默认 <HOME>/data。
+    """DATA_DIR 仅在 .env 中配置(> 默认 <HOME>/data)。
 
-    只解析 .env 里的 DATA_DIR 单键,不用 load_dotenv 整体加载——
-    避免把服务商 key 灌进 os.environ,破坏测试与进程隔离。
-    需在模块常量求值前执行,kb.sqlite / lancedb / wiki 等路径统一从这里派生。
+    路径类配置不读 shell 环境变量——环境变量入口只有 CODEATLAS_HOME。
+    单键解析而非整体 load,避免把服务商 key 灌进 os.environ。
     """
-    val = os.environ.get("DATA_DIR") or _lookup_env_key("DATA_DIR")
+    val = _lookup_env_key("DATA_DIR")
     return Path(val).expanduser() if val else CODEATLAS_HOME / "data"
 
 
