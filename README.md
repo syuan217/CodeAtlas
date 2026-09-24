@@ -76,8 +76,8 @@ atlas wiki my-service            # 生成代码导读(data/wiki/<repo>/README.md
 | 命令 | 说明 |
 |---|---|
 | `atlas index [--repo N] [--full] [--no-embed]` | 索引 repos.yaml 仓库(遍历→符号→切块→FTS→向量);`--full` 全量重解析;`--no-embed` 纯本地索引(零 API 费用) |
-| `atlas rebuild-calls [--repo N]` | 重算全库调用边(不动向量,零嵌入费) |
-| `atlas repair-vectors` | 修复向量表(消重复/孤儿行) |
+| `atlas index --rebuild-calls` | 索引后全量重算调用边(升级/规则变化后;零费用) |
+| `atlas index --repair-vectors` | 索引后按缓存重建向量表(lancedb 损坏时;零费用) |
 | `atlas index-docs` | `~/.codeatlas/data/docs/` 人工文档入库(ask 可引用) |
 
 **问答与结构查询**

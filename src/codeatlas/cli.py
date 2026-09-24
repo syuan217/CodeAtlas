@@ -211,6 +211,14 @@ def index(
         False, "--no-embed",
         help="纯本地索引(FTS/符号/调用边,跳过向量;零 API 费用;后补 --full 可重嵌)",
     ),
+    rebuild_calls: bool = typer.Option(
+        False, "--rebuild-calls",
+        help="索引后全量重算调用边(升级版本/解析规则变化后用;零 API 费用)",
+    ),
+    repair_vectors: bool = typer.Option(
+        False, "--repair-vectors",
+        help="索引后按缓存重建向量表(lancedb 损坏/误删时用;零 API 费用)",
+    ),
 ) -> None:
     """索引 repos.yaml 中的仓库:遍历→符号→切块→FTS→(可选)embedding→LanceDB。"""
     repos = load_repos()
@@ -248,8 +256,23 @@ def index(
         if stats.mode == "git" and stats.head_commit:
             console.print(f"[dim]indexed_commit → {stats.head_commit[:12]}[/dim]")
 
+    import subprocess
+    import sys
 
-@app.command()
+    def tail_cmd(args: list[str]) -> None:
+        r = subprocess.run([sys.executable, "-m", "codeatlas", *args])
+        if r.returncode != 0:
+            raise typer.Exit(code=r.returncode)
+
+    if rebuild_calls:
+        console.rule("index · rebuild-calls")
+        tail_cmd(["rebuild-calls"] + (["--repo", repo] if repo else []))
+    if repair_vectors:
+        console.rule("index · repair-vectors")
+        tail_cmd(["repair-vectors"])
+
+
+@app.command("repair-vectors", hidden=True)
 def repair_vectors() -> None:
     """一次性修复向量表:按 vector_refs + embed_cache 重写,消除重复/孤儿行。"""
     conn = connect()
@@ -531,7 +554,7 @@ def calls_sample(
         conn.close()
 
 
-@app.command("rebuild-calls")
+@app.command("rebuild-calls", hidden=True)
 def rebuild_calls(
     repo: str = typer.Option(None, "--repo", help="只处理指定仓库(缺省=全部已索引)"),
 ) -> None:
