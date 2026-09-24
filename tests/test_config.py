@@ -134,3 +134,31 @@ def test_ensure_dirs_creates_layout(tmp_path, monkeypatch):
     for sub in ("lancedb", "wiki", "docs", "profiles", "reports"):
         assert (tmp_path / sub).is_dir()
     assert (tmp_path / "docs" / "README.md").exists()
+
+
+def test_repos_yaml_resolution(monkeypatch, tmp_path):
+    """REPOS_YAML:shell env > .env 行 > 默认 <HOME>/repos.yaml。"""
+    from codeatlas import config as cfg
+
+    monkeypatch.delenv("REPOS_YAML", raising=False)
+    monkeypatch.delenv("CODEATLAS_HOME", raising=False)
+    monkeypatch.setattr(cfg, "ENV_FILE", tmp_path / "no.env")
+    # 默认
+    assert cfg._resolve_repos_yaml() == cfg.CODEATLAS_HOME / "repos.yaml"
+    # .env 行
+    env = tmp_path / ".env2"
+    env.write_text("REPOS_YAML=/custom/path/repos.yaml\n", encoding="utf-8")
+    monkeypatch.setattr(cfg, "ENV_FILE", env)
+    assert cfg._resolve_repos_yaml() == Path("/custom/path/repos.yaml")
+    # shell env 优先
+    monkeypatch.setenv("REPOS_YAML", "/from/shell.yaml")
+    assert cfg._resolve_repos_yaml() == Path("/from/shell.yaml")
+
+
+def test_home_universal_dir(monkeypatch):
+    from codeatlas import config as cfg
+
+    monkeypatch.delenv("CODEATLAS_HOME", raising=False)
+    assert cfg._resolve_home() == Path.home() / ".codeatlas"  # 不再跟随 cwd
+    monkeypatch.setenv("CODEATLAS_HOME", "/tmp/atlas-home")
+    assert cfg._resolve_home() == Path("/tmp/atlas-home")

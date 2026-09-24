@@ -109,7 +109,7 @@ atlas wiki my-service            # 生成代码导读(data/wiki/<repo>/README.md
 
 ## 配置与数据
 
-**目录解析**(按优先级):环境变量 `CODEATLAS_HOME` > 当前目录(存在 `.env` 或 `repos.yaml` 时,即源码检出场景)> `~/.codeatlas`。所有配置、仓库清单与数据(kb.sqlite / lancedb / wiki / docs / profiles / reports / ddl)都跟随该目录;每人独立实例。`DATA_DIR` 可单独指定数据位置。
+**目录解析**:配置统一放在 `~/.codeatlas`(不跟随源码/工作目录);可用环境变量 `CODEATLAS_HOME` 整体指定。`.env` 与 `repos.yaml` 都在这里;`repos.yaml` 的位置可在 `.env` 中用 `REPOS_YAML=/路径/repos.yaml` 指定,数据目录用 `DATA_DIR` 指定(kb.sqlite / lancedb / wiki / docs / profiles / reports / ddl 都在 DATA_DIR 下);每人独立实例。
 
 **.env 关键项**(完整模板见 `.env.example` / 包内模板):
 

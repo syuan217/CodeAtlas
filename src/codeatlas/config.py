@@ -19,25 +19,47 @@ TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
 
 
 def _resolve_home() -> Path:
-    """工作目录解析(安装分发支持):
+    """配置主目录(2026-09-24 起:不再跟随源码目录,统一通用目录):
 
     1) 环境变量 CODEATLAS_HOME(显式指定);
-    2) 当前目录存在 .env 或 repos.yaml(源码检出/项目目录运行——向后兼容);
-    3) ~/.codeatlas(wheel/pipx 安装后的默认)。
+    2) ~/.codeatlas(默认)。
     """
     env = os.environ.get("CODEATLAS_HOME")
     if env:
         return Path(env).expanduser()
-    cwd = Path.cwd()
-    if (cwd / ".env").exists() or (cwd / "repos.yaml").exists():
-        return cwd
     return Path.home() / ".codeatlas"
 
 
 CODEATLAS_HOME = _resolve_home()
 
 ENV_FILE = CODEATLAS_HOME / ".env"
-REPOS_YAML = CODEATLAS_HOME / "repos.yaml"
+
+
+def _lookup_env_key(key: str) -> str | None:
+    """从 HOME/.env 里解析单键(不做整体 load,防 key 灌入 os.environ)。"""
+    if not ENV_FILE.exists():
+        return None
+    try:
+        for line in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("#") or "=" not in line:
+                continue
+            k, _, raw = line.partition("=")
+            if k.strip() == key:
+                return raw.split(" #")[0].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return None
+
+
+def _resolve_repos_yaml() -> Path:
+    """repos.yaml 位置:shell 环境变量 REPOS_YAML > .env 中 REPOS_YAML 行 >
+    默认 <HOME>/repos.yaml。"""
+    val = os.environ.get("REPOS_YAML") or _lookup_env_key("REPOS_YAML")
+    return Path(val).expanduser() if val else CODEATLAS_HOME / "repos.yaml"
+
+
+REPOS_YAML = _resolve_repos_yaml()
 
 
 def _resolve_data_dir() -> Path:
@@ -47,20 +69,8 @@ def _resolve_data_dir() -> Path:
     避免把服务商 key 灌进 os.environ,破坏测试与进程隔离。
     需在模块常量求值前执行,kb.sqlite / lancedb / wiki 等路径统一从这里派生。
     """
-    val = os.environ.get("DATA_DIR")
-    if val is None and ENV_FILE.exists():
-        try:
-            for line in ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if line.startswith("#") or "=" not in line:
-                    continue
-                key, _, raw = line.partition("=")
-                if key.strip() == "DATA_DIR":
-                    val = raw.split(" #")[0].strip().strip('"').strip("'")
-                    break
-        except OSError:
-            pass
-    return Path(val) if val else CODEATLAS_HOME / "data"
+    val = os.environ.get("DATA_DIR") or _lookup_env_key("DATA_DIR")
+    return Path(val).expanduser() if val else CODEATLAS_HOME / "data"
 
 
 # 运行时目录(整体 gitignore,见 PLAN §6/§13)
