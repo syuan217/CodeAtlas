@@ -179,8 +179,13 @@ def index_repo(
     full: bool = False,
     conn: sqlite3.Connection | None = None,
     lance: LanceStore | None = None,
+    no_embed: bool = False,
 ) -> IndexStats:
-    """索引单个仓库;embed_provider 供测试注入,生产默认实时构建。"""
+    """索引单个仓库;embed_provider 供测试注入,生产默认实时构建。
+
+    no_embed=True(--no-embed):纯本地索引——FTS/符号/调用边可用,跳过 embedding;
+    向量检索不可用,后续配置好 embedding 后 `index --full` 全量重嵌即可补上。
+    """
     t0 = time.time()
     settings = settings or get_settings()
     own_conn = conn is None
@@ -219,13 +224,14 @@ def index_repo(
     dependent_rels = _dependent_files(conn, repo_id, cs.changes) - changed_rels
 
     # 完整性自愈:库中向量不完整的文件并入处理(scan 模式 mtime 跳过/中断残留),
-    # 幂等重处理会删旧子树重建,embed_cache 命中不重复计费
-    for r in conn.execute(
+    # 幂等重处理会删旧子树重建,embed_cache 命中不重复计费(no_embed 模式跳过)
+    heal_rows = [] if no_embed else conn.execute(
         "SELECT f.path FROM files f WHERE f.repo_id=? AND f.parse_status='ok' "
         "AND EXISTS (SELECT 1 FROM chunks c WHERE c.file_id=f.id "
         "  AND NOT EXISTS (SELECT 1 FROM vector_refs v WHERE v.chunk_id=c.id))",
         (repo_id,),
-    ):
+    ).fetchall()
+    for r in heal_rows:
         if r["path"] not in cs.changes and (repo.path / r["path"]).exists():
             cs.changes[r["path"]] = "M"
 
@@ -247,12 +253,13 @@ def index_repo(
         for rel, status in batch:
             _process_file(
                 conn, lance, repo, repo_id, rel, status, cs.head_commit,
-                settings, stats, import_refs, embed_pending, call_files, force=full,
+                settings, stats, import_refs, embed_pending, call_files,
+                force=full, no_embed=no_embed,
             )
         conn.commit()
 
     # ---- 批量 embedding(全部 flush 后;embed 与 close 同一 event loop)----
-    if embed_pending:
+    if embed_pending and not no_embed:
         provider = embed_provider or EmbeddingProvider(settings, conn)
         own_provider = embed_provider is None
 
@@ -367,6 +374,7 @@ def _light_imports(repo: RepoCfg, rel: str) -> tuple[str, list[str]] | None:
 def _process_file(
     conn, lance, repo, repo_id, rel, status, head_commit, settings, stats,
     import_refs, embed_pending, call_files, force: bool = False,
+    no_embed: bool = False,
 ) -> None:
     abs_path = repo.path / rel
     try:
@@ -385,7 +393,7 @@ def _process_file(
         and existing is not None
         and existing["hash"] == new_hash
         and existing["parse_status"] == "ok"
-        and _file_fully_embedded(conn, existing["id"])
+        and (no_embed or _file_fully_embedded(conn, existing["id"]))
     ):
         stats.skipped_unchanged += 1
         return

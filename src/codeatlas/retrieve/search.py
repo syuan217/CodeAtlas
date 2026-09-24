@@ -255,11 +255,15 @@ async def retrieve(
     query: str,
     s: Settings,
     conn: sqlite3.Connection,
-    embedder: EmbeddingProvider,
-    lance: LanceStore,
+    embedder: EmbeddingProvider | None,
+    lance: LanceStore | None,
     repo_id: int | None = None,
 ) -> list[Candidate]:
-    """三路召回 + 图扩展,RRF 融合,返回按融合分降序的候选。"""
+    """三路召回 + 图扩展,RRF 融合,返回按融合分降序的候选。
+
+    embedder=None(未配置 embedding/纯本地模式)时跳过向量路,
+    FTS + 符号 + 图扩展照常工作。
+    """
     by_chunk: dict[int, Candidate] = {}
 
     def add(chunk_ids: list[int], source: str, offset: int = 0) -> None:
@@ -270,15 +274,16 @@ async def retrieve(
             c.sources.add(source)
             c.score += 1.0 / (RRF_K + rank + offset)
 
-    # a. 向量召回
-    vec = await embedder.embed_query(query)
-    for c in _vector_recall(vec, s, lance, repo_id):
-        if c.chunk_id not in by_chunk:
-            by_chunk[c.chunk_id] = c
-        else:
-            by_chunk[c.chunk_id].sources.update(c.sources)
-            by_chunk[c.chunk_id].vec_sim = by_chunk[c.chunk_id].vec_sim or c.vec_sim
-            by_chunk[c.chunk_id].score += c.score
+    # a. 向量召回(embedder=None 时跳过,纯本地检索)
+    if embedder is not None and lance is not None:
+        vec = await embedder.embed_query(query)
+        for c in _vector_recall(vec, s, lance, repo_id):
+            if c.chunk_id not in by_chunk:
+                by_chunk[c.chunk_id] = c
+            else:
+                by_chunk[c.chunk_id].sources.update(c.sources)
+                by_chunk[c.chunk_id].vec_sim = by_chunk[c.chunk_id].vec_sim or c.vec_sim
+                by_chunk[c.chunk_id].score += c.score
 
     # b. 关键词召回
     add(_fts_recall(conn, query, repo_id), FTS_SOURCE)

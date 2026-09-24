@@ -195,8 +195,12 @@ async def _doctor() -> None:
 def index(
     repo: str = typer.Option(None, "--repo", help="只索引指定仓库(缺省 = repos.yaml 全部)"),
     full: bool = typer.Option(False, "--full", help="忽略 git 基线,强制全量重解析"),
+    no_embed: bool = typer.Option(
+        False, "--no-embed",
+        help="纯本地索引(FTS/符号/调用边,跳过向量;零 API 费用;后补 --full 可重嵌)",
+    ),
 ) -> None:
-    """索引 repos.yaml 中的仓库:遍历→符号→切块→FTS→embedding→LanceDB。"""
+    """索引 repos.yaml 中的仓库:遍历→符号→切块→FTS→(可选)embedding→LanceDB。"""
     repos = load_repos()
     if not repos:
         console.print("[yellow]repos.yaml 里没有仓库;请编辑 repos.yaml 填入本地路径[/yellow]")
@@ -212,16 +216,19 @@ def index(
         raise typer.Exit(code=1)
 
     s = get_settings()
-    if not (s.embed_base_url and s.embed_api_key and s.embed_model):
+    embed_ready = bool(s.embed_base_url and s.embed_api_key and s.embed_model)
+    if not embed_ready and not no_embed:
         console.print(
-            "[red]Embedding 未配置:atlas index 需要 .env 里的 EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL[/red]"
+            "[red]Embedding 未配置:atlas index 需要配置 EMBED_*,或使用 --no-embed 纯本地索引[/red]"
         )
         raise typer.Exit(code=1)
+    if no_embed:
+        console.print("[yellow]--no-embed:纯本地索引,向量检索不可用(atlas search/ask 的 FTS 路正常)。[/yellow]")
 
     for r in repos:
         console.rule(f"index {r.name}")
         try:
-            stats = index_repo(r, settings=s, full=full)
+            stats = index_repo(r, settings=s, full=full, no_embed=no_embed or not embed_ready)
         except (ProviderError, CostLimitExceeded) as e:
             console.print(f"[red]{r.name} 索引中断:{e}[/red]")
             raise typer.Exit(code=1)
@@ -910,6 +917,77 @@ async def _agent(question: str, repo_name: str | None, max_turns: int) -> None:
     finally:
         await embedder.aclose()
         await llm.aclose()
+        conn.close()
+
+
+@app.command("search")
+def search_cmd(
+    query: str = typer.Argument(..., help="关键词/标识符/自然语言"),
+    repo: str = typer.Option(None, "--repo", help="限定仓库"),
+    top_k: int = typer.Option(10, "-k", help="返回条数"),
+    no_vector: bool = typer.Option(False, "--no-vector", help="跳过向量路(纯 FTS+符号)"),
+) -> None:
+    """检索(零 LLM):返回相关代码/文档片段与符号位置,不生成回答。"""
+    from codeatlas.db.lance import LanceStore
+    from codeatlas.retrieve.search import retrieve
+
+    s = get_settings()
+    conn = connect()
+    try:
+        init_db(conn)
+        repo_id = None
+        if repo:
+            row = conn.execute("SELECT id FROM repos WHERE name=?", (repo,)).fetchone()
+            if row is None:
+                console.print(f"[red]仓库 {repo!r} 未索引[/red]")
+                raise typer.Exit(code=1)
+            repo_id = row["id"]
+
+        embedder = None
+        lance = None
+        if not no_vector and (s.embed_base_url and s.embed_api_key and s.embed_model):
+            embedder = EmbeddingProvider(s, conn)
+            lance = LanceStore(s)
+
+        async def _run():
+            try:
+                return await retrieve(query, s, conn, embedder, lance, repo_id=repo_id)
+            finally:
+                if embedder is not None:
+                    await embedder.aclose()
+
+        cands = asyncio.run(_run())
+        if not cands:
+            console.print("[yellow]无命中。[/yellow]")
+            return
+        ph = ",".join("?" * min(len(cands), top_k))
+        info = {
+            r["id"]: r for r in conn.execute(
+                f"SELECT c.id, c.title, c.line_start, c.line_end, c.kind, "
+                f"       f.path AS fpath FROM chunks c "
+                f"LEFT JOIN files f ON c.file_id=f.id WHERE c.id IN ({ph})",
+                [c.chunk_id for c in cands[:top_k]],
+            )
+        }
+        table = Table(title=f"检索: {query}")
+        for col in ("#", "位置", "标题/符号", "来源", "得分"):
+            table.add_column(col)
+        for i, cand in enumerate(cands[:top_k], 1):
+            r = info.get(cand.chunk_id)
+            if r is None:
+                continue
+            loc = r["fpath"] or f"wiki:{r['title']}"
+            table.add_row(
+                str(i), f"{loc}:{r['line_start']}-{r['line_end']}",
+                (r["title"] or "")[:60], r["kind"],
+                f"{cand.score:.4f}" + (f"/{cand.vec_sim:.2f}" if cand.vec_sim else ""),
+            )
+        console.print(table)
+        console.print(
+            f"[dim]召回 {len(cands)} 条,显示 {min(top_k, len(cands))};"
+            f"{'向量+FTS+符号' if embedder else 'FTS+符号(无向量配置或 --no-vector)'}[/dim]"
+        )
+    finally:
         conn.close()
 
 
