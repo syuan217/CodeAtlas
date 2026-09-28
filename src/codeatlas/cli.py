@@ -39,7 +39,11 @@ from codeatlas.retrieve.context import build_context
 from codeatlas.retrieve.rerank import maybe_rerank
 from codeatlas.retrieve.search import retrieve
 
-app = typer.Typer(help="codeatlas · 本地代码知识库", no_args_is_help=True)
+app = typer.Typer(
+    help="codeatlas · 本地代码知识库",
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["--help", "-h"]},
+)
 console = Console()
 
 
