@@ -34,6 +34,8 @@ class AgentResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost: float = 0.0
+    # 会话记忆:system + 历次问答对(不含工具过程消息),供下一轮 run_agent 复用
+    messages: list[dict] = field(default_factory=list)
 
 
 async def run_agent(
@@ -43,17 +45,20 @@ async def run_agent(
     toolbox: ToolBox,
     repo_name: str | None = None,
     max_turns: int = DEFAULT_MAX_TURNS,
+    history: list[dict] | None = None,
 ) -> AgentResult:
     result = AgentResult(answer="")
-    messages: list[dict] = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": question + (
-                f"\n(分析范围限定仓库:{repo_name})" if repo_name else ""
-            ),
-        },
+    # 记忆跨问题延续;工具调用消息只在本次提问的工作副本里流转
+    memory = list(history) if history else [
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT}
     ]
+    user_msg = {
+        "role": "user",
+        "content": question + (
+            f"\n(分析范围限定仓库:{repo_name})" if repo_name else ""
+        ),
+    }
+    messages: list[dict] = memory + [user_msg]
     final = ""
     for turn in range(1, max_turns + 1):
         result.turns = turn
@@ -113,4 +118,5 @@ async def run_agent(
 
     result.answer = final
     result.tool_trace = toolbox.calls
+    result.messages = memory + [user_msg, {"role": "assistant", "content": final}]
     return result

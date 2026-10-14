@@ -101,6 +101,37 @@ def test_run_agent_loop(jenv, tmp_path):
     assert mock.requests[0].get("tools")            # 首轮带工具规格
     roles = [m["role"] for m in mock.requests[2]["messages"]]
     assert "tool" in roles                          # 工具结果已回传
+    # messages = system + 本问问答对(供会话记忆复用)
+    assert [m["role"] for m in result.messages] == ["system", "user", "assistant"]
+    assert result.messages[2]["content"] == result.answer
+
+
+def test_run_agent_history_memory(jenv, tmp_path):
+    """会话记忆:第二问携带第一问问答对,但不携带工具过程消息。"""
+    mock = AgentMockTransport()
+    llm = LLMProvider(jenv.settings, jenv.conn, transport=mock, backoff_base=0)
+    tb = ToolBox(jenv.conn, tmp_path / "java_mini", None)
+    r1 = asyncio.run(run_agent("字符串截断被谁使用", llm, jenv.conn, tb))
+    r2 = asyncio.run(run_agent(
+        "那它的调用方还有谁", llm, jenv.conn, tb, history=r1.messages))
+    # 第 4 次请求 = 第二问首轮(mock 脚本:前 3 次 = 第一问)
+    msgs = mock.requests[3]["messages"]
+    assert "tool" not in [m["role"] for m in msgs]  # 工具过程不入记忆
+    assert any(m["role"] == "user" and "字符串截断" in m.get("content", "")
+               for m in msgs)                       # 第一问在记忆里
+    assert any(m["role"] == "assistant" and m.get("content") == r1.answer
+               for m in msgs)                       # 第一答在记忆里
+    assert [m["role"] for m in r2.messages] == [
+        "system", "user", "assistant", "user", "assistant",
+    ]
+
+
+def test_toolbox_reset(jenv, tmp_path):
+    tb = ToolBox(jenv.conn, tmp_path / "java_mini", None)
+    asyncio.run(tb.execute("definition", {"symbol": "truncate"}))
+    assert tb.calls
+    tb.reset()
+    assert tb.calls == []
 
 
 def test_run_agent_turn_limit_forces_answer(jenv, tmp_path):
@@ -138,3 +169,6 @@ def test_run_agent_turn_limit_forces_answer(jenv, tmp_path):
     result = asyncio.run(run_agent("x", llm, jenv.conn, tb, max_turns=3))
     assert result.answer == "被迫总结完毕"
     assert result.turns == 3
+    # 强制综答的合成提示只进工作副本,不进会话记忆
+    assert all("上限" not in (m.get("content") or "") for m in result.messages)
+    assert result.messages[-1]["role"] == "assistant"

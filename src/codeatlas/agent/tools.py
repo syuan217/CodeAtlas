@@ -150,6 +150,10 @@ class ToolBox:
         self.calls.append({"tool": name, "args": args, "result_chars": len(result)})
         return _truncate(result)
 
+    def reset(self) -> None:
+        """清空调用轨迹(会话模式下每个问题独立计轨迹)。"""
+        self.calls = []
+
     # ---- 各工具实现 ----
 
     async def _search(self, query: str) -> str:

@@ -134,3 +134,66 @@ def test_json_outputs(isolated_db):
     assert data["schema_version"] == "1"
     assert "counts" in data and "repos" in data
     assert "┌" not in r.output  # 无表格框线
+
+
+def test_trim_history():
+    """会话记忆瘦身:保留 system + 最近 keep_pairs 组问答对。"""
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(4):
+        msgs += [
+            {"role": "user", "content": f"q{i}"},
+            {"role": "assistant", "content": f"a{i}"},
+        ]
+    out = cli_mod._trim_history(msgs, 2)
+    assert out == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "q3"},
+        {"role": "assistant", "content": "a3"},
+    ]
+
+
+def test_session_reader_non_tty_falls_back_to_input(monkeypatch):
+    """非 tty(管道/脚本):回退内置 input(),行为与之前一致。"""
+    import asyncio
+    import io
+    import sys as _sys
+
+    monkeypatch.setattr(_sys, "stdin", io.StringIO())  # isatty() -> False
+    monkeypatch.setattr("builtins.input", lambda prompt="": "管道问题")
+    read = cli_mod._make_session_reader()
+    assert asyncio.run(read()) == "管道问题"
+
+
+def test_session_reader_tty_uses_prompt_toolkit(monkeypatch):
+    """tty:走 prompt_toolkit 异步接口(修 libedit CJK 宽字符退格错位)。"""
+
+    class TtyStdin:
+        @staticmethod
+        def isatty():
+            return True
+
+    def _no_builtin_input(prompt=""):
+        raise AssertionError("tty 下不应回退 input()")
+
+    import asyncio
+
+    import prompt_toolkit
+
+    seen = {}
+
+    class FakePS:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def prompt_async(self, p, **kw):
+            seen["prompt"] = p
+            return "中文输入"
+
+    monkeypatch.setattr("sys.stdin", TtyStdin())
+    monkeypatch.setattr("builtins.input", _no_builtin_input)
+    monkeypatch.setattr(prompt_toolkit, "PromptSession", FakePS)
+    read = cli_mod._make_session_reader()
+    assert asyncio.run(read()) == "中文输入"
+    assert seen["prompt"] == "❯ "

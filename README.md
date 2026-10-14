@@ -6,15 +6,15 @@
 
 | 能力 | 命令 | 说明 |
 |---|---|---|
-| **语义问答** | `atlas ask "问题"` | 带着真实的 `文件:行号` 引用回答代码问题;代码、wiki、体检报告、人工文档一起参与检索 |
+| **智能问答** | `atlas ask "问题"` | LLM 自主调用检索/调用链/读文件工具,多轮收集证据后一次性作答(带 `文件:行号` 引用;代码、wiki、体检报告、人工文档一起参与检索) |
 | **代码检索** | `atlas search "关键词"` | 零 LLM 的融合检索(向量+全文+符号),直接输出 文件:行号 命中列表;无任何 API 配置也可用 |
 | **结构查询** | `atlas callers / callees / definition / impact` | 确定性调用链查询(谁调用了 X / 改 X 影响哪里),不经过 LLM,结果 100% 可信 |
-| **Agent 问答** | `atlas agent "问题"` | LLM 自主调用检索/调用链/读文件工具,多轮收集证据后作答(适合多跳问题) |
+| **Agent 会话** | `atlas agent` | 交互式多轮带记忆问答:上下文跨问题保留,适合连续追问;`/exit` 或 Ctrl-D 关闭会话 |
 | **wiki 文档** | `atlas wiki <repo>` | 生成 zread 风格的代码导读(章节目录/面包屑/上下页导航,行内引用可点击跳转源码) |
 | **OB 索引体检** | `atlas collect / audit` | 解析 OceanBase DDL + 提取代码中的 SQL 访问路径 + 慢查询证据,输出索引合理性报告(无主键/冗余索引/高频条件列无索引/扫描返回比异常等 10 条规则) |
 | **运维** | `atlas status / cost / doctor / repair-vectors` | 库状态、费用流水、端点体检、向量表修复 |
 
-工作原理:tree-sitter 提取符号与调用边(每条边带 exact/heuristic 置信标签)→ 按符号切块(真实行号)→ LanceDB 向量 + SQLite FTS5 全文双路召回 → RRF 融合 → 图扩展(调用/导入关系)→ 上下文组装作答。全部数据本地存储(SQLite + LanceDB 文件目录)。
+工作原理:tree-sitter 提取符号与调用边(每条边带 exact/heuristic 置信标签)→ 按符号切块(真实行号)→ LanceDB 向量 + SQLite FTS5 全文双路召回 → RRF 融合 → 图扩展(调用/导入关系);问答由 LLM 工具循环消费这些能力(search/callers/impact/read_file)。全部数据本地存储(SQLite + LanceDB 文件目录)。
 
 ## 安装
 
@@ -63,9 +63,9 @@ atlas doctor
 
 # 4) 索引 → 使用
 atlas index                      # 首次索引(增量;可中断重跑续传)
-atlas ask "登录是怎么实现的" --repo my-service
+atlas ask "改 X 会影响哪些上游?"        # 一次性问答(工具循环,答完即退)
 atlas callers "userService" --repo my-service
-atlas agent "改 X 会影响哪些上游?"
+atlas agent                              # 开启会话:多轮追问,记忆保留;/exit 退出
 atlas wiki my-service            # 生成代码导读(data/wiki/<repo>/README.md 进入)
 ```
 
@@ -84,9 +84,9 @@ atlas wiki my-service            # 生成代码导读(data/wiki/<repo>/README.md
 
 | 命令 | 说明 |
 |---|---|
-| `atlas ask "问题" [--repo N]` | 单轮融合检索问答(向量+FTS+符号+图扩展) |
+| `atlas ask "问题" [--repo N] [--max-turns 6]` | 一次性问答:LLM 工具循环(检索/调用链/读文件)多轮收集证据后作答,适合多跳问题 |
 | `atlas search "关键词" [--repo N] [-k 10] [--no-vector]` | 零 LLM 检索:直接输出 文件:行号 命中列表 |
-| `atlas agent "问题" [--repo N] [--max-turns 6]` | 工具循环问答(检索/调用链/读文件,多跳问题) |
+| `atlas agent ["首问"] [--repo N] [--max-turns 6] [--memory-turns 8]` | 交互式会话:多轮带记忆问答(记忆=最近 N 组问答对);`/exit`、`/quit` 或 Ctrl-D 关闭 |
 | `atlas definition / callers / callees <符号>` | 符号定义 / 调用方 / 被调方 |
 | `atlas impact <符号> [--depth N]` | 影响面(沿调用链向上传播) |
 | `atlas calls-sample [-n 30]` | 随机抽样调用边供人工核对 |

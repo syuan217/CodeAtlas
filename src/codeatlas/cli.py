@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import sys
 import time
 from pathlib import Path
 
@@ -35,9 +36,6 @@ from codeatlas.ingest.indexer import index_repo
 from codeatlas.providers._retry import CostLimitExceeded, ProviderError
 from codeatlas.providers.embedding import EmbeddingProvider, unpack_vector
 from codeatlas.providers.llm import LLMProvider
-from codeatlas.retrieve.context import build_context
-from codeatlas.retrieve.rerank import maybe_rerank
-from codeatlas.retrieve.search import retrieve
 
 app = typer.Typer(
     help="codeatlas · 本地代码知识库",
@@ -304,92 +302,83 @@ def _emit_json(data) -> None:
     console.print_json(_json.dumps(data, ensure_ascii=False, default=str))
 
 
-QA_SYSTEM_PROMPT = (
-    "你是代码库问答助手。只基于 <context> 标签内提供的代码片段回答问题;"
-    "引用代码时使用格式 [相对路径:起始行-结束行](行号必须来自片段开头的 [lines A-B] 标注,"
-    "不得自行推算);上下文不足以回答时明确说\"知识库中未找到\",禁止编造。"
-    "回答使用与问题相同的语言。"
-)
+def _agent_env(repo_name: str | None):
+    """装配 agent 运行环境:解析仓库 → conn/lance/embedder/llm → ToolBox。"""
+    from codeatlas.agent.tools import ToolBox
+    from codeatlas.db.lance import LanceStore
+    from codeatlas.retrieve.search import retrieve
 
-
-async def _ask(question: str, repo_name: str | None) -> None:
     s = get_settings()
     conn = connect()
     init_db(conn)
     repo_id = None
+    repo_root = None
     if repo_name:
-        row = conn.execute("SELECT id FROM repos WHERE name=?", (repo_name,)).fetchone()
+        row = conn.execute("SELECT id, path FROM repos WHERE name=?", (repo_name,)).fetchone()
         if row is None:
-            console.print(f"[red]仓库 {repo_name!r} 未索引(先运行 atlas index --repo {repo_name})[/red]")
+            console.print(f"[red]仓库 {repo_name!r} 未索引[/red]")
             conn.close()
             raise typer.Exit(code=1)
-        repo_id = row["id"]
-
-    from codeatlas.db.lance import LanceStore
+        repo_id, repo_root = row["id"], Path(row["path"])
 
     lance = LanceStore(s)
     embedder = EmbeddingProvider(s, conn)
     llm = LLMProvider(s, conn)
-    try:
-        cands = await retrieve(question, s, conn, embedder, lance, repo_id=repo_id)
-        corpus = conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
-        cands = maybe_rerank(question, cands, s, corpus)
-        if not cands:
-            console.print("[yellow]知识库中未找到相关内容(候选为空)。[/yellow]")
-            return
-        context, used = build_context(
-            conn, cands, top_n=s.context_top_n,
-            budget_tokens=s.llm_context_window - 2048,
-        )
-        if not context:
-            console.print("[yellow]知识库中未找到相关内容(上下文组装为空)。[/yellow]")
-            return
 
-        messages = [
-            {"role": "system", "content": QA_SYSTEM_PROMPT},
-            {"role": "user",
-             "content": f"<context>\n{context}\n</context>\n\n问题:{question}"},
-        ]
-        r = await llm.chat(messages, stage="ask", repo_id=repo_id)
-        console.print(Panel(r.content, title="回答"))
-        # 引用清单(来自实际装填的候选)
-        console.print("[bold]引用来源(检索命中,供核对):[/bold]")
-        ph = ",".join("?" * len(used))
-        rows = conn.execute(
-            f"SELECT c.id AS cid, c.title, c.line_start, c.line_end, f.path AS fpath "
-            f"FROM chunks c LEFT JOIN files f ON c.file_id=f.id WHERE c.id IN ({ph})",
-            [c.chunk_id for c in used],
-        ).fetchall()
-        by_id = {r_["cid"]: r_ for r_ in rows}
-        for cand in used:
-            r_ = by_id.get(cand.chunk_id)
-            if r_ is None:
-                continue
-            sim = f" sim={cand.vec_sim:.2f}" if cand.vec_sim is not None else ""
-            loc = r_['fpath'] or f"wiki/{r_['title'] or ''}"  # wiki chunk 无 file_id
+    async def _retrieve(query: str):
+        return await retrieve(query, s, conn, embedder, lance, repo_id=repo_id)
+
+    toolbox = ToolBox(conn, repo_root, repo_id, retriever=_retrieve)
+    return conn, toolbox, embedder, llm
+
+
+def _print_agent_result(result, cumulative_cost: float | None = None) -> None:
+    if result.tool_trace:
+        console.print("[bold]工具调用轨迹:[/bold]")
+        for i, c in enumerate(result.tool_trace, 1):
+            args_short = str(c["args"])[:60]
             console.print(
-                f"  [{loc}:{r_['line_start']}-{r_['line_end']}] "
-                f"{r_['title'] or ''}{sim} [dim]({'+'.join(sorted(cand.sources))})[/dim]"
+                f"  {i}. {c['tool']}({args_short}) → {c['result_chars']} 字符"
             )
-        price_note = "" if r.priced else "  [yellow](单价未知,cost=0)[/yellow]"
-        console.print(
-            f"[dim]召回 {len(cands)} 条 → 装填 {len(used)} 条;"
-            f"本次费用 {r.cost:.6f} 元(tokens {r.prompt_tokens}+{r.completion_tokens})"
-            f"{price_note}[/dim]"
-        )
-    finally:
-        await embedder.aclose()
-        await llm.aclose()
-        conn.close()
+    cum = (f" · 会话累计 {cumulative_cost:.6f} 元"
+           if cumulative_cost is not None else "")
+    console.print(
+        f"[dim]轮数 {result.turns} · 工具调用 {len(result.tool_trace)} 次 · "
+        f"tokens {result.prompt_tokens}+{result.completion_tokens} · "
+        f"费用 {result.cost:.6f} 元{cum}[/dim]"
+    )
 
 
-@app.command()
-def ask(
-    question: str = typer.Argument(..., help="自然语言问题"),
-    repo: str = typer.Option(None, "--repo", help="限定检索的仓库(缺省=全部)"),
-) -> None:
-    """语义问答:融合检索 → 上下文组装 → LLM 单轮作答(带 文件:行号 引用)。"""
-    asyncio.run(_ask(question, repo))
+def _trim_history(history: list[dict], keep_pairs: int) -> list[dict]:
+    """会话记忆瘦身:保留 system + 最近 keep_pairs 组问答对(组 = user+assistant)。"""
+    system = [m for m in history if m["role"] == "system"]
+    qa = [m for m in history if m["role"] != "system"]
+    return system + qa[-2 * keep_pairs:]
+
+
+def _make_session_reader():
+    """会话输入 reader(异步):tty 下用 prompt_toolkit(macOS libedit 对 CJK
+    宽字符退格重绘错位;prompt_toolkit 按 wcwidth 计算,且自带 ↑ 历史),
+    管道/未安装时回退内置 input()。Ctrl-C/Ctrl-D 协议与 input() 一致。
+    注意会话本身跑在事件循环里,prompt_toolkit 必须走 prompt_async。
+    """
+    if sys.stdin.isatty():
+        try:
+            from prompt_toolkit import PromptSession
+        except ImportError:
+            pass
+        else:
+            ps: PromptSession = PromptSession()
+
+            async def _read() -> str:
+                return await ps.prompt_async("❯ ")
+
+            return _read
+
+    async def _read() -> str:  # noqa: F811
+        return input("❯ ")
+
+    return _read
 
 
 def _resolve_symbol_or_exit(conn, pattern: str, repo: str | None):
@@ -949,35 +938,10 @@ def index_docs_cmd() -> None:
         conn.close()
 
 
-async def _agent(question: str, repo_name: str | None, max_turns: int) -> None:
+async def _ask(question: str, repo_name: str | None, max_turns: int) -> None:
     from codeatlas.agent.loop import DEFAULT_MAX_TURNS, run_agent
-    from codeatlas.agent.tools import ToolBox
-    from codeatlas.db.lance import LanceStore
-    from codeatlas.retrieve.search import retrieve
 
-    s = get_settings()
-    conn = connect()
-    init_db(conn)
-    repo_id = None
-    repo_root = None
-    if repo_name:
-        row = conn.execute("SELECT id, path FROM repos WHERE name=?", (repo_name,)).fetchone()
-        if row is None:
-            console.print(f"[red]仓库 {repo_name!r} 未索引[/red]")
-            conn.close()
-            raise typer.Exit(code=1)
-        repo_id, repo_root = row["id"], Path(row["path"])
-
-    lance = LanceStore(s)
-    embedder = EmbeddingProvider(s, conn)
-    llm = LLMProvider(s, conn)
-
-    async def _retrieve(query: str):
-        return await retrieve(
-            query, s, conn, embedder, lance, repo_id=repo_id
-        )
-
-    toolbox = ToolBox(conn, repo_root, repo_id, retriever=_retrieve)
+    conn, toolbox, embedder, llm = _agent_env(repo_name)
     try:
         with console.status("[bold]agent 思考中…[/bold]"):
             result = await run_agent(
@@ -985,22 +949,70 @@ async def _agent(question: str, repo_name: str | None, max_turns: int) -> None:
                 max_turns=max_turns or DEFAULT_MAX_TURNS,
             )
         console.print(Panel(result.answer, title="回答"))
-        if result.tool_trace:
-            console.print("[bold]工具调用轨迹:[/bold]")
-            for i, c in enumerate(result.tool_trace, 1):
-                args_short = str(c["args"])[:60]
-                console.print(
-                    f"  {i}. {c['tool']}({args_short}) → {c['result_chars']} 字符"
-                )
-        console.print(
-            f"[dim]轮数 {result.turns} · 工具调用 {len(result.tool_trace)} 次 · "
-            f"tokens {result.prompt_tokens}+{result.completion_tokens} · "
-            f"费用 {result.cost:.6f} 元[/dim]"
-        )
+        _print_agent_result(result)
     finally:
         await embedder.aclose()
         await llm.aclose()
         conn.close()
+
+
+async def _agent_session(
+    first_question: str | None, repo_name: str | None,
+    max_turns: int, memory_turns: int,
+) -> None:
+    from codeatlas.agent.loop import DEFAULT_MAX_TURNS, run_agent
+
+    conn, toolbox, embedder, llm = _agent_env(repo_name)
+    history: list[dict] | None = None
+    totals = {"questions": 0, "prompt": 0, "completion": 0, "cost": 0.0}
+    question = first_question
+    try:
+        scope = f"仓库 {repo_name}" if repo_name else "全部已索引仓库"
+        console.print(
+            f"[bold]agent 会话开启[/bold](范围:{scope} · "
+            f"记忆 {memory_turns} 轮 · 每问工具上限 {max_turns or DEFAULT_MAX_TURNS} 轮)\n"
+            f"[dim]直接输入问题,上下文跨问题保留;/exit 或 Ctrl-D 关闭会话。[/dim]"
+        )
+        read_line = _make_session_reader()
+        while True:
+            if question is None:
+                try:
+                    question = (await read_line()).strip()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if not question:
+                    continue
+                if question.lower() in ("/exit", "/quit"):
+                    break
+            toolbox.reset()
+            totals["questions"] += 1
+            try:
+                with console.status("[bold]agent 思考中…[/bold]"):
+                    result = await run_agent(
+                        question, llm, conn, toolbox, repo_name=repo_name,
+                        max_turns=max_turns or DEFAULT_MAX_TURNS,
+                        history=history,
+                    )
+            except KeyboardInterrupt:
+                console.print("[yellow]已中断本问(记忆保留,可继续提问)。[/yellow]")
+                question = None
+                continue
+            console.print(Panel(result.answer, title=f"回答 {totals['questions']}"))
+            totals["prompt"] += result.prompt_tokens
+            totals["completion"] += result.completion_tokens
+            totals["cost"] += result.cost
+            _print_agent_result(result, cumulative_cost=totals["cost"])
+            history = _trim_history(result.messages, memory_turns)
+            question = None
+    finally:
+        await embedder.aclose()
+        await llm.aclose()
+        conn.close()
+        console.print(
+            f"[dim]会话关闭:{totals['questions']} 个问题 · "
+            f"tokens {totals['prompt']}+{totals['completion']} · "
+            f"费用 {totals['cost']:.6f} 元[/dim]"
+        )
 
 
 @app.command("search")
@@ -1102,13 +1114,26 @@ def search_cmd(
 
 
 @app.command()
-def agent(
+def ask(
     question: str = typer.Argument(..., help="问题(支持多跳分析)"),
     repo: str = typer.Option(None, "--repo", help="限定仓库"),
     max_turns: int = typer.Option(6, "--max-turns", help="工具调用轮数上限"),
 ) -> None:
-    """agent 问答:LLM 自主调用检索/调用链/读文件工具,多轮收集证据后作答。"""
-    asyncio.run(_agent(question, repo, max_turns))
+    """一次性问答:LLM 自主调用检索/调用链/读文件工具,多轮收集证据后作答。"""
+    asyncio.run(_ask(question, repo, max_turns))
+
+
+@app.command()
+def agent(
+    question: str = typer.Argument(
+        None, help="首个问题(可选;缺省直接进入交互)"
+    ),
+    repo: str = typer.Option(None, "--repo", help="限定仓库"),
+    max_turns: int = typer.Option(6, "--max-turns", help="每个问题的工具调用轮数上限"),
+    memory_turns: int = typer.Option(8, "--memory-turns", help="记忆保留的最近问答轮数"),
+) -> None:
+    """交互式会话:多轮带记忆的 agent 问答;/exit、/quit 或 Ctrl-D 关闭会话。"""
+    asyncio.run(_agent_session(question, repo, max_turns, memory_turns))
 
 
 @app.command()

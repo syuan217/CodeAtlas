@@ -19,6 +19,8 @@ dependencies = [
     "pymysql>=1.1",
     "pathspec>=0.12",
     "pyyaml>=6.0",
+    # agent 会话交互输入:libedit 对 CJK 宽字符退格重绘错位,prompt_toolkit 修正
+    "prompt_toolkit>=3.0",
 ]
 
 [project.scripts]
