@@ -69,12 +69,18 @@ class Tbl:
     has_profile: bool
 
 
+def _schema_rows(conn: sqlite3.Connection, schema: str, cols: str = "id, name, row_count"):
+    """某库的 ddl_tables 行(按 "schema." 精确前缀;LIKE 的 _ 是通配符,会串库)。"""
+    prefix = f"{schema}."
+    return conn.execute(
+        f"SELECT {cols} FROM ddl_tables WHERE substr(name, 1, ?) = ?",
+        (len(prefix), prefix),
+    )
+
+
 def _load_tables(conn: sqlite3.Connection, schema: str) -> dict[str, Tbl]:
-    prefix = f"{schema}.%"
     tables: dict[str, Tbl] = {}
-    for r in conn.execute(
-        "SELECT id, name, row_count FROM ddl_tables WHERE name LIKE ?", (prefix,)
-    ):
+    for r in _schema_rows(conn, schema):
         bare = r["name"].split(".", 1)[1]
         if _is_excluded(bare):
             continue
@@ -103,17 +109,6 @@ def _load_tables(conn: sqlite3.Connection, schema: str) -> dict[str, Tbl]:
             row_count=r["row_count"], has_profile=r["row_count"] is not None,
         )
     return tables
-
-
-def _load_query_map(conn: sqlite3.Connection) -> list[dict]:
-    return [
-        dict(r)
-        for r in conn.execute(
-            "SELECT DISTINCT query_fingerprint, source_file, source_line, "
-            "       table_name, column_name, usage, freq "
-            "FROM query_column_map"
-        )
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +188,12 @@ def rule_idx002(qmap: list[dict], tables: dict[str, Tbl]) -> list[Finding]:
             t = tables.get(tbl)
             if t is None:
                 continue
+            # 已有别的索引(或主键)以查询列打头 → 这条查询有索引可走,不算错配
+            leading = {icols[0] for _, icols, _, _ in t.indexes if icols} | (
+                t.pk if len(t.pk) == 1 else set()
+            )
+            if cols & leading:
+                continue
             for iname, icols, _, _ in t.indexes:
                 if len(icols) < 2:
                     continue
@@ -222,32 +223,43 @@ def rule_idx002(qmap: list[dict], tables: dict[str, Tbl]) -> list[Finding]:
 
 
 def rule_idx003(tables: dict[str, Tbl]) -> list[Finding]:
-    """冗余索引:(a) ⊂ (a,b) 同表前缀包含。"""
+    """冗余索引:被另一索引(或主键)最左前缀覆盖的普通索引,含完全重复。
+
+    唯一索引承载约束,永不建议删除(仅当与另一唯一索引完全重复时删其一)。
+    """
     out = []
     for t in tables.values():
+        others = list(t.indexes)
+        if len(t.pk) == 1:
+            others.append(("PRIMARY", sorted(t.pk), True, None))
         for n1, c1, u1, _ in t.indexes:
-            for n2, c2, u2, _ in t.indexes:
-                if n1 == n2 or u1 != u2:
+            if not c1:
+                continue
+            for n2, c2, u2, _ in others:
+                if n1 == n2 or c2[: len(c1)] != c1:
                     continue
-                if len(c1) < len(c2) and c2[: len(c1)] == c1:
-                    out.append(
-                        Finding(
-                            table=t.name, rule_id="IDX003", severity="low",
-                            evidence={
-                                "kept": n2, "kept_columns": c2,
-                                "redundant": n1, "redundant_columns": c1,
-                            },
-                            suggestion=(
-                                f"索引 `{n1}`({c1}) 是 `{n2}`({c2}) 的前缀,"
-                                f"可删除:ALTER TABLE `{t.name}` DROP INDEX `{n1}`;"
-                            ),
-                        )
+                if len(c1) < len(c2):
+                    redundant = not u1  # 唯一前缀 (a) ⊂ (a,b) 不冗余:它约束的是 a 唯一
+                else:  # 列完全相同:保留唯一的那个;同为唯一/非唯一时按名字删后者
+                    redundant = (not u1 and u2) or (u1 == u2 and n1 > n2 and n2 != "PRIMARY") \
+                        or (u1 == u2 and n2 == "PRIMARY")
+                if not redundant:
+                    continue
+                out.append(
+                    Finding(
+                        table=t.name, rule_id="IDX003", severity="low",
+                        evidence={
+                            "kept": n2, "kept_columns": c2,
+                            "redundant": n1, "redundant_columns": c1,
+                        },
+                        suggestion=(
+                            f"索引 `{n1}`({c1}) 已被 `{n2}`({c2}) 的最左前缀覆盖,"
+                            f"可删除:ALTER TABLE `{t.name}` DROP INDEX `{n1}`;"
+                        ),
                     )
+                )
+                break  # 每个冗余索引报一次
     return out
-
-
-def _base_type(dt: str) -> str:
-    return (dt or "").split("(")[0].upper().strip()
 
 
 def rule_idx004(qmap: list[dict], tables: dict[str, Tbl]) -> list[Finding]:
@@ -281,11 +293,13 @@ def rule_idx004(qmap: list[dict], tables: dict[str, Tbl]) -> list[Finding]:
     return out
 
 
-def rule_idx005(anti_patterns: list[dict]) -> list[Finding]:
-    """索引失效写法(来自 sql_extract 的 LIKE '%x'/函数包裹列检测)。"""
+def rule_idx005(anti_patterns: list[dict], tables: dict[str, Tbl]) -> list[Finding]:
+    """索引失效写法(来自 sql_extract 的 LIKE '%x'/函数包裹列检测);只报本库的表。"""
     out = []
     seen: set[tuple] = set()
     for ap in anti_patterns:
+        if ap["table"] not in tables:
+            continue
         key = (ap["table"], ap["column"], ap["pattern"], ap["fingerprint"])
         if key in seen:
             continue
@@ -322,9 +336,7 @@ def run_audit(
     tables = _load_tables(conn, schema)
     excluded = [
         r["name"].split(".", 1)[1]
-        for r in conn.execute(
-            "SELECT name FROM ddl_tables WHERE name LIKE ?", (f"{schema}.%",)
-        )
+        for r in _schema_rows(conn, schema, "name")
         if _is_excluded(r["name"].split(".", 1)[1])
     ]
     result = AuditResult(
@@ -338,10 +350,13 @@ def run_audit(
     result.findings += rule_idx002(qmap, tables)
     result.findings += rule_idx003(tables)
     result.findings += rule_idx004(qmap, tables)
-    result.findings += rule_idx005(anti_patterns)
+    result.findings += rule_idx005(anti_patterns, tables)
 
-    # 慢查询类(QRY101):有统计条目才跑
-    slow = [q for q in (slow_queries or []) if q.get("rows_scanned") and q.get("rows_returned")]
+    # 慢查询类(QRY101):有统计条目才跑(返回 0 行的全表扫描恰恰最该报,不能按真值过滤)
+    slow = [
+        q for q in (slow_queries or [])
+        if q.get("rows_scanned") not in (None, "") and q.get("rows_returned") not in (None, "")
+    ]
     if slow:
         result.findings += _rule_qry101(schema, slow)
     else:
@@ -353,12 +368,87 @@ def run_audit(
         result.unavailable += ["IDX101", "IDX102", "IDX103"]
     else:
         result.findings += _rule_idx101(tables)
-        col_stats_ready = conn.execute(
-            "SELECT COUNT(*) AS c FROM ddl_columns WHERE cardinality IS NOT NULL"
-        ).fetchone()["c"]
-        if col_stats_ready == 0:
+        stats = _load_column_stats(conn, schema)
+        if not stats:
             result.unavailable += ["IDX102", "IDX103"]
+        else:
+            result.findings += _rule_idx102(tables, stats)
+            result.findings += _rule_idx103(tables, stats, qmap)
     return result
+
+
+def _load_column_stats(conn: sqlite3.Connection, schema: str) -> dict[tuple[str, str], dict]:
+    """{(表, 列): {cardinality, top_values}},只取本库、有统计的列;另并入索引基数。"""
+    out: dict[tuple[str, str], dict] = {}
+    for r in _schema_rows(conn, schema):
+        bare = r["name"].split(".", 1)[1]
+        for c in conn.execute(
+            "SELECT name, cardinality, top_values FROM ddl_columns "
+            "WHERE table_id=? AND (cardinality IS NOT NULL OR top_values IS NOT NULL)",
+            (r["id"],),
+        ):
+            out[(bare, c["name"])] = {
+                "cardinality": c["cardinality"],
+                "top_values": json.loads(c["top_values"]) if c["top_values"] else None,
+            }
+    return out
+
+
+def _single_col_indexes(t: Tbl):
+    """单列、非唯一、非主键的索引:(名, 列, 索引基数)。"""
+    for name, cols, unique, card in t.indexes:
+        if len(cols) == 1 and not unique and cols[0] not in t.pk:
+            yield name, cols[0], card
+
+
+def _rule_idx102(tables: dict[str, Tbl], stats: dict) -> list[Finding]:
+    """低区分度单列索引:基数 / 行数 < 10%(基数取索引基数,缺则取列基数)。"""
+    out = []
+    for t in tables.values():
+        if not t.row_count:
+            continue
+        for name, col, idx_card in _single_col_indexes(t):
+            card = idx_card if idx_card is not None else (stats.get((t.name, col)) or {}).get(
+                "cardinality")
+            if card is None:
+                continue
+            sel = card / t.row_count
+            if sel < 0.10:
+                out.append(Finding(
+                    table=t.name, rule_id="IDX102", severity="low",
+                    evidence={"index": name, "column": col, "cardinality": card,
+                              "row_count": t.row_count, "selectivity": round(sel, 6)},
+                    suggestion=(f"`{name}`({col}) 区分度 {sel:.2%},单列索引过滤效果差;"
+                                f"考虑并入以高区分度列打头的复合索引,或评估删除。"),
+                ))
+    return out
+
+
+def _rule_idx103(tables: dict[str, Tbl], stats: dict, qmap: list[dict]) -> list[Finding]:
+    """倾斜列索引:top1 值占比 > 90% 且代码中该列作条件的查询少(< 3 处)。"""
+    uses: dict[tuple[str, str], int] = {}
+    for q in qmap:
+        if q["usage"] == "where":
+            k = (q["table_name"], q["column_name"])
+            uses[k] = uses.get(k, 0) + (q["freq"] or 1)
+    out = []
+    for t in tables.values():
+        for name, col, _ in _single_col_indexes(t):
+            tv = (stats.get((t.name, col)) or {}).get("top_values") or []
+            counts = [float(v.get("n") or 0) for v in tv if isinstance(v, dict)]
+            total = t.row_count or sum(counts)
+            if not counts or not total:
+                continue
+            share = max(counts) / total
+            if share > 0.90 and uses.get((t.name, col), 0) < 3:
+                out.append(Finding(
+                    table=t.name, rule_id="IDX103", severity="low",
+                    evidence={"index": name, "column": col, "top1_share": round(share, 4),
+                              "where_uses_in_code": uses.get((t.name, col), 0)},
+                    suggestion=(f"`{col}` 取值高度倾斜(top1 占 {share:.0%})且少有查询以它为条件,"
+                                f"索引 `{name}` 收益有限;如只查少数值,考虑与其它列组合。"),
+                ))
+    return out
 
 
 def _rule_qry101(schema: str, slow: list[dict]) -> list[Finding]:
@@ -414,6 +504,64 @@ def _rule_idx101(tables: dict[str, Tbl]) -> list[Finding]:
                 )
             )
     return out
+
+
+def merge_slow_query_accesses(
+    conn: sqlite3.Connection, schemas, profiles_dir: Path
+) -> dict[str, list[dict]]:
+    """慢查询(各库 *_manual.json 的 slow_queries)→ 访问路径并入 query_column_map。
+
+    每次先清掉上一轮的慢查询行再写(列表为空也清),避免重跑后频次翻倍/残留;
+    返回 {库: 慢查询条目}(QRY101 用)。
+    """
+    from codeatlas.schema.collect_ob import _num, load_manual
+    from codeatlas.schema.sql_extract import (
+        _clean_dynamic,
+        _extract_accesses,
+        _resolve_table_alias,
+        _try_parse,
+        fingerprint_sql,
+    )
+
+    conn.execute(
+        "INSERT INTO repos(name, path, languages) VALUES('__codeatlas_reports__', '', '[]') "
+        "ON CONFLICT(name) DO UPDATE SET path=''"
+    )
+    sid = conn.execute(
+        "SELECT id FROM repos WHERE name='__codeatlas_reports__'"
+    ).fetchone()["id"]
+    conn.execute(
+        "DELETE FROM query_column_map WHERE repo_id=? AND source_file LIKE 'slow_query:%'",
+        (sid,),
+    )
+    slow_by_schema: dict[str, list[dict]] = {}
+    merged: dict[tuple, int] = {}  # (库, 指纹, 表, 列, usage) → 最大频次
+    for schema in schemas:
+        mp = Path(profiles_dir) / f"{schema}_manual.json"
+        if not mp.exists():
+            continue
+        slow = [q for q in (load_manual(mp).get("slow_queries") or []) if q.get("sql")]
+        slow_by_schema[schema] = slow
+        for q in slow:
+            sql = _clean_dynamic(str(q["sql"]))
+            stmt = _try_parse(sql)
+            if stmt is None:
+                continue
+            _, accesses = _extract_accesses(stmt)
+            _resolve_table_alias(stmt, accesses)
+            fp = fingerprint_sql(sql)
+            freq = int(_num(str(q.get("freq") or "")) or 1)
+            for a in accesses:
+                key = (schema, fp, a.table, a.column, a.usage)
+                merged[key] = max(merged.get(key, 0), freq)
+    conn.executemany(
+        "INSERT INTO query_column_map(repo_id, query_fingerprint, source_file, "
+        "source_line, table_name, column_name, usage, freq) VALUES(?,?,?,?,?,?,?,?)",
+        [(sid, fp, f"slow_query:{sch}", 0, tbl, col, usage, freq)
+         for (sch, fp, tbl, col, usage), freq in merged.items()],
+    )
+    conn.commit()
+    return slow_by_schema
 
 
 def render_report(results: list[AuditResult]) -> Path:
@@ -483,58 +631,36 @@ def persist_findings(conn: sqlite3.Connection, results: list[AuditResult]) -> No
 async def index_report(conn, lance, embedder, report_path, settings) -> int:
     """报告 chunk 入索引(PLAN §9.8:报告入向量库,供 atlas ask 引用)。
 
-    kind=report;重跑 audit 自动替换旧报告 chunk。
+    kind=report;重跑 audit 自动替换旧报告 chunk(FTS 行与向量一并替换)。
     """
-    import asyncio
-
-    from codeatlas.db.fts import fts_delete
+    from codeatlas.db.chunkstore import embed_chunks, insert_text_chunk, purge_chunks
     from codeatlas.ingest.chunker import chunk_markdown
-
-    old = conn.execute(
-        "SELECT id, content FROM chunks WHERE kind='report'"
-    ).fetchall()
-    for r in old:
-        fts_delete(conn, r["id"], r["content"])
-    conn.execute("DELETE FROM chunks WHERE kind='report'")
-    conn.commit()
 
     # 报告不属于单仓库:哨兵 repo 行承载外键(schema 勿动,PLAN 约束)
     conn.execute(
         "INSERT INTO repos(name, path, languages) VALUES('__codeatlas_reports__', '', '[]') "
         "ON CONFLICT(name) DO UPDATE SET path=''"
     )
-    conn.commit()
     repo_id = conn.execute(
         "SELECT id FROM repos WHERE name='__codeatlas_reports__'"
     ).fetchone()["id"]
-    n = 0
+    purge_chunks(conn, lance, repo_id=repo_id, kind="report")
     pending = []
     text = Path(report_path).read_text(encoding="utf-8", errors="replace")
+    stem = Path(report_path).stem
     for ch in chunk_markdown(text, settings.chunk_max_tokens):
-        cur = conn.execute(
-            "INSERT INTO chunks(repo_id, kind, title, content, content_hash, "
-            "line_start, line_end) VALUES(?,?,?,?,?,?,?)",
-            (repo_id, "report", f"report:{Path(report_path).stem}:{ch.title or ''}",
-             ch.content, ch.content_hash, ch.line_start, ch.line_end),
+        cid = insert_text_chunk(
+            conn, repo_id=repo_id, kind="report",
+            title=f"report:{stem}:{ch.title or ''}", chunk=ch,
         )
-        pending.append((cur.lastrowid, ch.content))
-        n += 1
+        pending.append((cid, ch.content))
     conn.commit()
-    if embedder is not None and pending:
-        try:
-            vectors = await embedder.embed(
-                [c for _, c in pending], stage="audit"
-            )
-            rows = [(cid, repo_id, "report", b) for (cid, _), b in zip(pending, vectors)]
-            for lance_id, chunk_id in lance.add_vectors(rows):
-                conn.execute(
-                    "INSERT INTO vector_refs(chunk_id, lance_id, model) VALUES(?,?,?)",
-                    (chunk_id, lance_id, embedder.s.embed_model),
-                )
-            conn.commit()
-        except Exception:
-            pass  # embedding 失败不阻塞(FTS 路径可用)
-    return n
+    try:
+        await embed_chunks(conn, lance, embedder, pending,
+                           repo_id=repo_id, kind="report", stage="audit")
+    except Exception:
+        pass  # embedding 失败不阻塞(FTS 路径可用)
+    return len(pending)
 
 
 async def index_docs(conn, lance, embedder, docs_dir, settings) -> int:
@@ -544,7 +670,7 @@ async def index_docs(conn, lance, embedder, docs_dir, settings) -> int:
     """
     from pathlib import Path as _P
 
-    from codeatlas.db.fts import fts_delete
+    from codeatlas.db.chunkstore import embed_chunks, insert_text_chunk, purge_chunks
     from codeatlas.ingest.chunker import chunk_markdown
 
     conn.execute(
@@ -554,40 +680,24 @@ async def index_docs(conn, lance, embedder, docs_dir, settings) -> int:
     repo_id = conn.execute(
         "SELECT id FROM repos WHERE name='__codeatlas_docs__'"
     ).fetchone()["id"]
-    old = conn.execute(
-        "SELECT id, content FROM chunks WHERE repo_id=? AND kind='doc'", (repo_id,)
-    ).fetchall()
-    for r in old:
-        fts_delete(conn, r["id"], r["content"])
-    conn.execute("DELETE FROM chunks WHERE repo_id=? AND kind='doc'", (repo_id,))
+    purge_chunks(conn, lance, repo_id=repo_id, kind="doc")
     conn.commit()
 
-    n = 0
     pending = []
     for page in sorted(_P(docs_dir).rglob("*.md")):
         if page.name == "README.md":
             continue
         text = page.read_text(encoding="utf-8", errors="replace")
         for ch in chunk_markdown(text, settings.chunk_max_tokens):
-            cur = conn.execute(
-                "INSERT INTO chunks(repo_id, kind, title, content, content_hash, "
-                "line_start, line_end) VALUES(?,?,?,?,?,?,?)",
-                (repo_id, "doc", f"docs:{page.relative_to(docs_dir)}:{ch.title or ''}",
-                 ch.content, ch.content_hash, ch.line_start, ch.line_end),
+            cid = insert_text_chunk(
+                conn, repo_id=repo_id, kind="doc",
+                title=f"docs:{page.relative_to(docs_dir)}:{ch.title or ''}", chunk=ch,
             )
-            pending.append((cur.lastrowid, ch.content))
-            n += 1
+            pending.append((cid, ch.content))
     conn.commit()
-    if embedder is not None and pending:
-        try:
-            vectors = await embedder.embed([c for _, c in pending], stage="index")
-            rows = [(cid, repo_id, "doc", b) for (cid, _), b in zip(pending, vectors)]
-            for lance_id, chunk_id in lance.add_vectors(rows):
-                conn.execute(
-                    "INSERT INTO vector_refs(chunk_id, lance_id, model) VALUES(?,?,?)",
-                    (chunk_id, lance_id, embedder.s.embed_model),
-                )
-            conn.commit()
-        except Exception:
-            pass
-    return n
+    try:
+        await embed_chunks(conn, lance, embedder, pending,
+                           repo_id=repo_id, kind="doc", stage="index")
+    except Exception:
+        pass
+    return len(pending)

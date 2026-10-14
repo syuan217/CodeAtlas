@@ -1,14 +1,11 @@
-"""wiki 两步生成(PLAN §9.7):XML 结构规划(四级容错)→ 逐页生成(状态机)。
+"""wiki 结构规划(PLAN §9.7):XML 结构规划 + 四级容错解析。
 
 - 结构规划输出页面候选来自模块划分(模型只做选择与排序);
-- 逐页:定向 grounding 打包 + 相邻模块接口摘要,并发信号量(默认 2),
-  页级重试 2 次(校验失败把错误清单喂回),失败写占位页保整体完成;
-- 断点:页面文件已存在且未标 stale 则跳过,可反复续跑。
+- 逐页生成、校验重试、单页失败隔离与落盘在 gencode/wiki.py。
 """
 
 from __future__ import annotations
 
-import asyncio
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -17,7 +14,7 @@ from pathlib import Path
 from codeatlas.providers.llm import LLMProvider
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
-GENERATOR_VERSION = "v1"
+GENERATOR_VERSION = "v2"  # 与在用的 *.v2.md prompt 一致
 
 
 @dataclass
@@ -151,7 +148,6 @@ async def plan_pages(
     repo_summary: str,
     modules_text: str,
     size_hint: str,
-    file_tree: str = '',
 ) -> list[Page]:
     prompt = (
         load_prompt("structure_planning.v2")
@@ -164,59 +160,3 @@ async def plan_pages(
         temperature=0.2, max_tokens=8192, thinking_disabled=True,
     )
     return parse_structure(r.content)
-
-
-async def generate_page(llm: LLMProvider, prompt: str) -> str:
-    r = await llm.chat(
-        [{"role": "user", "content": prompt}], stage="wiki",
-        temperature=0.2, max_tokens=16384, thinking_disabled=True,
-    )
-    return r.content
-
-
-async def run_pages(
-    llm: LLMProvider,
-    jobs: list[dict],  # [{page: Page, prompt: str}]
-    concurrency: int = 2,
-    retries: int = 2,
-) -> list[dict]:
-    """页生成状态机:并发受限,页级重试(重试时把校验错误清单附回 prompt)。"""
-    sem = asyncio.Semaphore(max(1, concurrency))
-    results: list[dict] = []
-
-    async def one(job: dict) -> None:
-        page: Page = job["page"]
-        async with sem:
-            last_err = ""
-            for attempt in range(retries + 1):
-                prompt = job["prompt"]
-                if last_err:
-                    prompt += (
-                        f"\n\n上一版未通过硬校验,错误清单(逐条修复,重新输出完整页面):\n{last_err}"
-                    )
-                try:
-                    content = await generate_page(llm, prompt)
-                    results.append(
-                        {"page": page, "content": content, "attempts": attempt + 1}
-                    )
-                    return
-                except Exception as e:  # 网络等异常
-                    last_err = f"生成异常:{e}"
-            results.append(
-                {
-                    "page": page,
-                    "content": _placeholder_page(page),
-                    "attempts": retries + 1,
-                    "failed": True,
-                }
-            )
-
-    await asyncio.gather(*[one(j) for j in jobs])
-    return results
-
-
-def _placeholder_page(page: Page) -> str:
-    return (
-        f"# {page.title or page.id}\n\n"
-        f"> ⚠️ 本页生成失败(占位页)。相关文件:{', '.join(page.file_paths)}\n"
-    )

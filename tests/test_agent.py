@@ -65,7 +65,7 @@ def test_tool_specs_shape():
 
 
 def test_toolbox_read_file_whitelist(jenv, tmp_path):
-    tb = ToolBox(jenv.conn, tmp_path / "java_mini", None)
+    tb = ToolBox(jenv.conn, None)
     out = asyncio.run(tb.execute(
         "read_file", {"path": "com/example/util/Strings.java",
                       "start_line": 1, "end_line": 5}))
@@ -76,7 +76,7 @@ def test_toolbox_read_file_whitelist(jenv, tmp_path):
 
 
 def test_toolbox_definition_and_callers(jenv, tmp_path):
-    tb = ToolBox(jenv.conn, tmp_path / "java_mini", None)
+    tb = ToolBox(jenv.conn, None)
     out = asyncio.run(tb.execute(
         "definition", {"symbol": "com.example.util.Strings#truncate"}))
     assert "Strings.java" in out and "truncate" in out
@@ -93,7 +93,7 @@ def test_truncate():
 def test_run_agent_loop(jenv, tmp_path):
     mock = AgentMockTransport()
     llm = LLMProvider(jenv.settings, jenv.conn, transport=mock, backoff_base=0)
-    tb = ToolBox(jenv.conn, tmp_path / "java_mini", None)
+    tb = ToolBox(jenv.conn, None)
     result = asyncio.run(run_agent("字符串截断被谁使用", llm, jenv.conn, tb))
     assert result.answer.startswith("结论")
     assert result.turns == 3
@@ -110,7 +110,7 @@ def test_run_agent_history_memory(jenv, tmp_path):
     """会话记忆:第二问携带第一问问答对,但不携带工具过程消息。"""
     mock = AgentMockTransport()
     llm = LLMProvider(jenv.settings, jenv.conn, transport=mock, backoff_base=0)
-    tb = ToolBox(jenv.conn, tmp_path / "java_mini", None)
+    tb = ToolBox(jenv.conn, None)
     r1 = asyncio.run(run_agent("字符串截断被谁使用", llm, jenv.conn, tb))
     r2 = asyncio.run(run_agent(
         "那它的调用方还有谁", llm, jenv.conn, tb, history=r1.messages))
@@ -127,7 +127,7 @@ def test_run_agent_history_memory(jenv, tmp_path):
 
 
 def test_toolbox_reset(jenv, tmp_path):
-    tb = ToolBox(jenv.conn, tmp_path / "java_mini", None)
+    tb = ToolBox(jenv.conn, None)
     asyncio.run(tb.execute("definition", {"symbol": "truncate"}))
     assert tb.calls
     tb.reset()
@@ -165,10 +165,96 @@ def test_run_agent_turn_limit_forces_answer(jenv, tmp_path):
 
     llm = LLMProvider(jenv.settings, jenv.conn, transport=AlwaysTool(),
                       backoff_base=0)
-    tb = ToolBox(jenv.conn, tmp_path / "java_mini", None)
+    tb = ToolBox(jenv.conn, None)
     result = asyncio.run(run_agent("x", llm, jenv.conn, tb, max_turns=3))
     assert result.answer == "被迫总结完毕"
     assert result.turns == 3
     # 强制综答的合成提示只进工作副本,不进会话记忆
     assert all("上限" not in (m.get("content") or "") for m in result.messages)
     assert result.messages[-1]["role"] == "assistant"
+
+
+def test_read_file_resolves_repo_root_from_index(jenv, tmp_path, monkeypatch):
+    """不带 --repo(ask 默认):按索引里的仓库路径读,与当前工作目录无关。"""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    tb = ToolBox(jenv.conn, None)
+    out = asyncio.run(tb.execute("read_file", {"path": "com/example/util/Strings.java"}))
+    assert "truncate" in out and "读取失败" not in out
+
+
+def test_read_file_same_path_in_two_repos(jenv, tmp_path):
+    other = tmp_path / "other"
+    (other / "com/example/util").mkdir(parents=True)
+    (other / "com/example/util/Strings.java").write_text(
+        "package com.example.util;\npublic class Strings { /* OTHER_REPO */ }\n"
+    , encoding="utf-8")
+    jenv.run(RepoCfg(name="other", path=other))
+    tb = ToolBox(jenv.conn, None)
+    out = asyncio.run(tb.execute("read_file", {"path": "com/example/util/Strings.java"}))
+    assert "jmini" in out and "other" in out and "repo" in out   # 歧义:列出仓库让模型指定
+    out2 = asyncio.run(tb.execute(
+        "read_file", {"path": "com/example/util/Strings.java", "repo": "other"}))
+    assert "OTHER_REPO" in out2
+    jid = jenv.one("SELECT id FROM repos WHERE name='jmini'")["id"]
+    scoped = ToolBox(jenv.conn, jid)                                  # --repo 限定时无歧义
+    assert "truncate" in asyncio.run(scoped.execute(
+        "read_file", {"path": "com/example/util/Strings.java"}))
+
+
+def test_search_results_carry_repo_name(jenv):
+    from codeatlas.retrieve.search import retrieve
+
+    async def _ret(q):
+        return await retrieve(q, jenv.settings, jenv.conn, None, None)
+
+    tb = ToolBox(jenv.conn, None, retriever=_ret)
+    out = asyncio.run(tb.execute("search", {"query": "truncate"}))
+    assert "repo=jmini" in out
+
+
+def test_run_agent_keeps_context_within_window(jenv, monkeypatch):
+    """多轮大工具结果:发给模型的消息总量不得超出 LLM_CONTEXT_WINDOW,
+    超出时最早的工具结果被替换为省略说明(问题与记忆不动)。"""
+    from codeatlas.agent.tools import approx_tokens
+
+    s = jenv.settings.model_copy(update={"llm_context_window": 20_000})
+
+    class BigTool(httpx.MockTransport):
+        def __init__(self):
+            self.bodies = []
+            super().__init__(self._h)
+
+        def _h(self, request):
+            body = json.loads(request.content)
+            self.bodies.append(body)
+            n = len(self.bodies)
+            if n <= 4:
+                msg = {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": f"c{n}", "type": "function",
+                    "function": {"name": "search", "arguments": json.dumps({"query": f"q{n}"})},
+                }]}
+            else:
+                msg = {"role": "assistant", "content": "done"}
+            return httpx.Response(200, json={
+                "choices": [{"message": msg}], "model": "test-model",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+
+    mock = BigTool()
+    llm = LLMProvider(s, jenv.conn, transport=mock, backoff_base=0)
+    tb = ToolBox(jenv.conn, None)
+
+    async def huge(name, args):
+        return "订单数据" * 2_000  # 约 8000 tokens(中文按字计)
+
+    monkeypatch.setattr(tb, "execute", huge)
+    result = asyncio.run(run_agent("问题", llm, jenv.conn, tb, max_turns=6))
+    assert result.answer == "done"
+    budget = 20_000 - 8192
+    for body in mock.bodies:
+        total = sum(approx_tokens(m.get("content") or "") for m in body["messages"])
+        assert total <= budget
+    last = mock.bodies[-1]["messages"]
+    assert any("已省略" in (m.get("content") or "") for m in last if m["role"] == "tool")
+    assert last[1]["role"] == "user" and last[1]["content"].startswith("问题")

@@ -6,14 +6,33 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from codeatlas.agent.tools import TOOL_SPECS, ToolBox
+from codeatlas.agent.tools import TOOL_SPECS, ToolBox, approx_tokens
 from codeatlas.providers.llm import LLMProvider
 
 DEFAULT_MAX_TURNS = 6
+MAX_OUTPUT_TOKENS = 8192
+_ELIDED = "(早前的工具结果已省略以控制上下文;如仍需要,请重新调用工具)"
+
+
+def _fit_context(messages: list[dict], budget: int) -> None:
+    """总量超预算时,从最早的工具结果起逐条替换为省略说明(原地修改工作副本);
+    system / 问题 / 会话记忆不动。"""
+    def size(m: dict) -> int:
+        return approx_tokens(m.get("content") or "") + approx_tokens(
+            json.dumps(m.get("tool_calls") or "", ensure_ascii=False))
+
+    total = sum(size(m) for m in messages)
+    for m in messages:
+        if total <= budget:
+            return
+        if m["role"] == "tool" and m["content"] != _ELIDED:
+            total -= size(m)
+            m["content"] = _ELIDED
+            total += size(m)
 
 AGENT_SYSTEM_PROMPT = (
     "你是代码库分析 agent,通过调用工具收集证据后回答问题。准则:\n"
@@ -59,11 +78,15 @@ async def run_agent(
         ),
     }
     messages: list[dict] = memory + [user_msg]
+    # 输入预算 = 模型窗口 - 输出预留;工具定义本身也占输入,按其 JSON 体量扣除
+    budget = (llm.s.llm_context_window - MAX_OUTPUT_TOKENS
+              - approx_tokens(json.dumps(TOOL_SPECS, ensure_ascii=False)))
     final = ""
     for turn in range(1, max_turns + 1):
         result.turns = turn
+        _fit_context(messages, budget)
         r = await llm.chat(
-            messages, stage="agent", temperature=0.2, max_tokens=8192,
+            messages, stage="agent", temperature=0.2, max_tokens=MAX_OUTPUT_TOKENS,
             thinking_disabled=True, tools=TOOL_SPECS,
         )
         result.prompt_tokens += r.prompt_tokens
@@ -87,12 +110,10 @@ async def run_agent(
                 ],
             }
         )
-        import json as _json
-
         for tc in r.tool_calls:
             try:
-                args = _json.loads(tc["arguments"] or "{}")
-            except _json.JSONDecodeError:
+                args = json.loads(tc["arguments"] or "{}")
+            except json.JSONDecodeError:
                 args = {}
             output = await toolbox.execute(tc["name"], args)
             messages.append(
@@ -107,8 +128,9 @@ async def run_agent(
                 "信息不足之处明确列出。",
             }
         )
+        _fit_context(messages, budget)
         r = await llm.chat(
-            messages, stage="agent", temperature=0.2, max_tokens=8192,
+            messages, stage="agent", temperature=0.2, max_tokens=MAX_OUTPUT_TOKENS,
             thinking_disabled=True,
         )
         result.prompt_tokens += r.prompt_tokens

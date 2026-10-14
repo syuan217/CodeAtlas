@@ -7,10 +7,9 @@ read_file。全部只读;read_file 的路径必须 ∈ 索引文件白名单(防
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
-
-from codeatlas.ingest.chunker import estimate_tokens
 
 TOOL_RESULT_BUDGET = 32_000
 READ_FILE_MAX_LINES = 500
@@ -97,6 +96,8 @@ TOOL_SPECS = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "仓库内相对路径"},
+                    "repo": {"type": "string",
+                             "description": "仓库名(search 结果里的 repo=;同路径存在于多个仓库时必填)"},
                     "start_line": {"type": "integer"},
                     "end_line": {"type": "integer"},
                 },
@@ -107,12 +108,28 @@ TOOL_SPECS = [
 ]
 
 
+_CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]")
+
+
+def approx_tokens(text: str) -> int:
+    """粗估 token:中文(含全角标点)按 1 字 1 token,其余按 3 字符 1 token。
+    ingest.chunker.estimate_tokens 统一按 len/3,对中文低估约 3 倍,不适合做上下文预算。"""
+    cjk = len(_CJK.findall(text))
+    return cjk + (len(text) - cjk) // 3
+
+
 def _truncate(text: str, budget: int = TOOL_RESULT_BUDGET) -> str:
-    if estimate_tokens(text) <= budget:
+    if approx_tokens(text) <= budget:
         return text
-    # 按行截断(保守:估算 token ~ len/3)
-    max_chars = budget * 3
-    out = text[:max_chars]
+    # 二分出不超预算的最长前缀,再退到行边界
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if approx_tokens(text[:mid]) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    out = text[:lo]
     cut = out.rfind("\n")
     return (out[:cut] if cut > 0 else out) + f"\n…(截断,完整结果 {len(text)} 字符)"
 
@@ -120,10 +137,8 @@ def _truncate(text: str, budget: int = TOOL_RESULT_BUDGET) -> str:
 class ToolBox:
     """工具执行器:持有库连接与检索依赖,方法与 TOOL_SPECS 一一对应。"""
 
-    def __init__(self, conn: sqlite3.Connection, repo_root: Path | None,
-                 repo_id: int | None, retriever=None):
+    def __init__(self, conn: sqlite3.Connection, repo_id: int | None, retriever=None):
         self.conn = conn
-        self.repo_root = repo_root
         self.repo_id = repo_id
         self._retriever = retriever  # async retrieve(query, ...) 可调用
         self.calls: list[dict] = []  # 轨迹
@@ -142,7 +157,7 @@ class ToolBox:
                 result = self._impact(args["symbol"], args.get("depth") or 10)
             elif name == "read_file":
                 result = self._read_file(args["path"], args.get("start_line") or 1,
-                                         args.get("end_line") or 200)
+                                         args.get("end_line") or 200, args.get("repo"))
             else:
                 result = f"未知工具:{name}"
         except Exception as e:
@@ -166,8 +181,10 @@ class ToolBox:
         ph = ",".join("?" * min(len(cands), 20))
         info = {
             r["id"]: r for r in self.conn.execute(
-                f"SELECT c.id, c.title, c.line_start, c.line_end, f.path AS fpath "
-                f"FROM chunks c LEFT JOIN files f ON c.file_id=f.id WHERE c.id IN ({ph})",
+                f"SELECT c.id, c.title, c.line_start, c.line_end, f.path AS fpath, "
+                f"       r.name AS repo "
+                f"FROM chunks c LEFT JOIN files f ON c.file_id=f.id "
+                f"JOIN repos r ON c.repo_id=r.id WHERE c.id IN ({ph})",
                 [c.chunk_id for c in cands[:20]],
             )
         }
@@ -176,9 +193,11 @@ class ToolBox:
             if r is None:
                 continue
             loc = r["fpath"] or (r["title"] or "")
+            # 多仓库同路径常见:带上仓库名,read_file 据此消歧
+            repo = "" if r["repo"].startswith("__") else f"repo={r['repo']}, "
             rows.append(
                 f"{rank}. [{loc}:{r['line_start']}-{r['line_end']}] {r['title'] or ''} "
-                f"(score={cand.score:.4f}, src={'+'.join(sorted(cand.sources))})"
+                f"({repo}score={cand.score:.4f}, src={'+'.join(sorted(cand.sources))})"
             )
         return "\n".join(rows)
 
@@ -202,6 +221,14 @@ class ToolBox:
             f"签名:{s['signature'] or '-'}"
         )
 
+    @staticmethod
+    def _ambiguous(syms: list[dict]) -> str:
+        lines = [
+            f"- {s['qualified_name']}  [{s['repo']}] {s['fpath']}:{s['line_start']}"
+            for s in syms[:10]
+        ]
+        return (f"符号歧义({len(syms)} 个),请改用完整限定名重查:\n" + "\n".join(lines))
+
     def _call_edges(self, symbol: str, direction: str) -> str:
         from codeatlas.graph.queries import callees_of, callers_of, find_symbols
 
@@ -209,7 +236,7 @@ class ToolBox:
         if not syms:
             return f"未找到符号:{symbol}"
         if len(syms) > 1:
-            return f"符号歧义({len(syms)} 个),请用完整限定名,如 {syms[0]['qualified_name']}"
+            return self._ambiguous(syms)
         edges = (callers_of if direction == "callers" else callees_of)(self.conn, syms[0])
         if not edges:
             return f"无{direction} 边"
@@ -226,7 +253,7 @@ class ToolBox:
         if not syms:
             return f"未找到符号:{symbol}"
         if len(syms) > 1:
-            return f"符号歧义({len(syms)} 个),请用完整限定名,如 {syms[0]['qualified_name']}"
+            return self._ambiguous(syms)
         rows = impact_of(self.conn, syms[0], max_depth=int(depth))
         if not rows:
             return "无受影响方法"
@@ -240,15 +267,26 @@ class ToolBox:
             + "\n文件清单:" + ", ".join(files[:20])
         )
 
-    def _read_file(self, path: str, start: int, end: int) -> str:
-        row = self.conn.execute(
-            "SELECT f.path FROM files f WHERE f.path=? "
-            + ("AND f.repo_id=?" if self.repo_id is not None else ""),
-            [path] + ([self.repo_id] if self.repo_id is not None else []),
-        ).fetchone()
-        if row is None:
+    def _read_file(self, path: str, start: int, end: int, repo: str | None = None) -> str:
+        # 白名单:只读索引内文件;仓库根取自索引(与当前工作目录无关)
+        where, params = ["f.path=?"], [path]
+        if self.repo_id is not None:
+            where.append("f.repo_id=?")
+            params.append(self.repo_id)
+        if repo:
+            where.append("r.name=?")
+            params.append(repo)
+        rows = self.conn.execute(
+            "SELECT r.name AS repo, r.path AS root FROM files f "
+            "JOIN repos r ON f.repo_id=r.id WHERE " + " AND ".join(where),
+            params,
+        ).fetchall()
+        if not rows:
             return f"路径不在索引内:{path}(只允许读已索引文件)"
-        real = (self.repo_root / path) if self.repo_root else Path(path)
+        if len(rows) > 1:
+            names = ", ".join(r["repo"] for r in rows)
+            return f"{path} 同时存在于多个仓库({names}),请带 repo 参数重读"
+        real = Path(rows[0]["root"]) / path
         try:
             lines = real.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:

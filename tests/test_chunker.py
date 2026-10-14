@@ -4,7 +4,6 @@ from pathlib import Path
 
 from codeatlas.config import content_hash
 from codeatlas.ingest.chunker import (
-    ChunkOut,
     chunk_code,
     chunk_markdown,
     chunk_text,
@@ -157,7 +156,7 @@ def test_markdown_oversize_section_falls_back():
 
 
 def test_fixture_readme_chunks():
-    text = (FIXTURES / "java_mini" / "README.md").read_text()
+    text = (FIXTURES / "java_mini" / "README.md").read_text(encoding="utf-8")
     chunks = chunk_markdown(text, max_tokens=512)
     titles = [c.title for c in chunks]
     assert "Model Layer" in titles
@@ -176,3 +175,61 @@ def test_chunk_text_dispatch():
 def test_estimate_tokens():
     assert estimate_tokens("a" * 300) == 100
     assert estimate_tokens("") == 1
+
+
+SPRING_CTRL = """package com.x.web;
+
+import com.x.svc.OrderService;
+
+@RestController
+public class OrderController {
+    private final OrderService orderService;
+
+    /**
+     * 创建订单入口
+     */
+    @PostMapping("/orders/create")
+    @Transactional(rollbackFor = Exception.class)
+    public Long create(Req r) {
+        return orderService.create(r);
+    }
+
+    @Value("${order.limit}")
+    private int dailyOrderLimit;
+
+    @GetMapping("/orders/{id}")
+    public Order get(Long id) {
+        return orderService.get(id);
+    }
+}
+"""
+
+
+def test_method_chunk_includes_javadoc_and_annotations():
+    src = SPRING_CTRL.encode()
+    fs = extract_symbols("com/x/web/OrderController.java", "java", src)
+    chunks = chunk_code(SPRING_CTRL, fs, 512)
+    create = next(c for c in chunks if c.title == "com.x.web.OrderController#create")
+    assert '@PostMapping("/orders/create")' in create.content
+    assert "创建订单入口" in create.content
+    assert create.line_start == 9 and create.line_end == 16
+    get = next(c for c in chunks if c.title == "com.x.web.OrderController#get")
+    assert get.content.lstrip().startswith('@GetMapping("/orders/{id}")')
+
+
+def test_code_outside_symbols_is_chunked():
+    src = SPRING_CTRL.encode()
+    fs = extract_symbols("com/x/web/OrderController.java", "java", src)
+    chunks = chunk_code(SPRING_CTRL, fs, 512)
+    assert any("dailyOrderLimit" in c.content for c in chunks)  # 方法之间声明的字段
+    covered = "\n".join(c.content for c in chunks)
+    assert covered.count("dailyOrderLimit") == 1                 # 不重复覆盖
+    assert not any(c.content.strip() in ("}", "") for c in chunks)  # 不产出纯括号块
+
+    py = 'import os\n\nROUTES = {"a": 1, "b": 2}\n\n\n@app.get("/x")\ndef handler():\n    return 1\n\n\nif __name__ == "__main__":\n    main()\n'
+    pfs = extract_symbols("app.py", "python", py.encode())
+    pchunks = chunk_code(py, pfs, 512)
+    h = next(c for c in pchunks if c.title == "app.handler")
+    assert h.content.startswith('@app.get("/x")')
+    rest = "\n".join(c.content for c in pchunks)
+    assert "ROUTES" in rest and "__main__" in rest

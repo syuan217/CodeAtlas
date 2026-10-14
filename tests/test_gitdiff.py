@@ -18,9 +18,9 @@ def make_repo(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
     git(root, "init")
-    (root / "a.txt").write_text("alpha")
+    (root / "a.txt").write_text("alpha", encoding="utf-8")
     (root / "sub").mkdir()
-    (root / "sub" / "b.txt").write_text("beta")
+    (root / "sub" / "b.txt").write_text("beta", encoding="utf-8")
     git(root, "add", "-A")
     git(root, "commit", "-m", "init")
     return root
@@ -52,8 +52,8 @@ def test_git_detects_modify_add_delete(tmp_path):
     root = make_repo(tmp_path)
     head = cs_of(root).head_commit
 
-    (root / "a.txt").write_text("alpha2")
-    (root / "c.txt").write_text("gamma")
+    (root / "a.txt").write_text("alpha2", encoding="utf-8")
+    (root / "c.txt").write_text("gamma", encoding="utf-8")
     (root / "sub" / "b.txt").unlink()
     git(root, "add", "-A")
     git(root, "commit", "-m", "changes")
@@ -76,7 +76,7 @@ def test_git_rename_becomes_delete_plus_add(tmp_path):
 def test_dirty_worktree_falls_back_to_scan(tmp_path):
     root = make_repo(tmp_path)
     head = cs_of(root).head_commit
-    (root / "a.txt").write_text("uncommitted change")  # 未 commit → diff 看不到
+    (root / "a.txt").write_text("uncommitted change", encoding="utf-8")  # 未 commit → diff 看不到
     cs = cs_of(root, indexed=head)
     assert cs.mode == "scan"
     # known 为空 → 全部文件视为新增(scan 模式下由 indexer 的 hash 幂等跳过兜底)
@@ -92,7 +92,7 @@ def test_missing_base_commit_falls_back_to_scan(tmp_path):
 def test_non_git_dir_uses_scan(tmp_path):
     root = tmp_path / "plain"
     root.mkdir()
-    (root / "x.txt").write_text("x")
+    (root / "x.txt").write_text("x", encoding="utf-8")
     cs = cs_of(root)
     assert cs.mode == "scan"
     assert cs.changes == {"x.txt": "A"}
@@ -102,14 +102,14 @@ def test_scan_compares_hash_and_mtime(tmp_path):
     root = tmp_path / "plain"
     root.mkdir()
     f = root / "x.txt"
-    f.write_text("v1")
+    f.write_text("v1", encoding="utf-8")
     from codeatlas.config import hash_bytes
 
     known = {"x.txt": (hash_bytes(b"v1"), f.stat().st_mtime)}
     cs = cs_of(root, known=known)
     assert cs.is_noop  # hash+mtime 均未变
 
-    f.write_text("v2")
+    f.write_text("v2", encoding="utf-8")
     cs = cs_of(root, known=known)
     assert cs.changes == {"x.txt": "M"}
 

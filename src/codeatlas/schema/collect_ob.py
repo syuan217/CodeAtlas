@@ -10,8 +10,11 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
+
+import sqlglot
 
 from codeatlas.config import PROFILES_DIR
 from codeatlas.schema.ddl import ParsedDDL
@@ -29,30 +32,39 @@ def _suspect_columns(t) -> list[str]:
     return out[:5]  # 每表最多抽 5 列,控制脚本规模
 
 
+def _qi(name: str) -> str:
+    """MySQL 反引号标识符(内部反引号双写转义)。"""
+    return "`" + name.replace("`", "``") + "`"
+
+
 def generate_scripts(parsed: dict[str, ParsedDDL], out_dir: Path | None = None) -> list[Path]:
     """为每个库生成只读采集脚本。所有语句均为 SELECT,无任何写操作。"""
     out_dir = out_dir or PROFILES_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for schema, p in parsed.items():
+        # 库名来自文件名、表/列名来自 DDL:一律转义后再拼,保证脚本确实只读
+        lit = schema.replace("\\", "\\\\").replace("'", "''")
         lines = [
             f"-- codeatlas 画像采集脚本(只读 SELECT):{schema}",
             "-- 在生产库执行后将结果按 <schema>_manual.json 模板回填。",
             "",
+            f"USE {_qi(schema)};",
+            "",
             "-- 1) 表规模与长度(一次查全库)",
             "SELECT TABLE_NAME, TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH, AUTO_INCREMENT",
-            "FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{s}';".format(s=schema),
+            f"FROM information_schema.TABLES WHERE TABLE_SCHEMA = '{lit}';",
             "",
             "-- 2) 索引基数(逐表执行 SHOW INDEX)",
         ]
         for t in p.tables:
-            lines.append(f"SHOW INDEX FROM `{t.name}`;")
+            lines.append(f"SHOW INDEX FROM {_qi(t.name)};")
         lines += ["", "-- 3) 低基数嫌疑列抽样(逐条执行;大表请评估成本后执行)"]
         for t in p.tables:
             for col in _suspect_columns(t):
                 lines.append(
-                    f"SELECT `{col}`, COUNT(*) AS n FROM `{t.name}` "
-                    f"GROUP BY `{col}` ORDER BY n DESC LIMIT 10;  -- {t.name}.{col}"
+                    f"SELECT {_qi(col)}, COUNT(*) AS n FROM {_qi(t.name)} "
+                    f"GROUP BY {_qi(col)} ORDER BY n DESC LIMIT 10;"
                 )
         path = out_dir / f"{schema}_queries.sql"
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -61,7 +73,10 @@ def generate_scripts(parsed: dict[str, ParsedDDL], out_dir: Path | None = None) 
 
 
 def manual_template(schema: str, parsed: ParsedDDL, out_dir: Path | None = None) -> Path:
-    """生成人工回填 JSON 模板(结构即约定;不确定的项保持 null)。"""
+    """生成人工回填 JSON 模板(结构即约定;不确定的项保持 null)。
+
+    文件已存在时只补新表/新键,已填的值、导入的慢查询一律保留(重跑 collect 不丢数据)。
+    """
     out_dir = out_dir or PROFILES_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     tpl = {
@@ -89,6 +104,16 @@ def manual_template(schema: str, parsed: ParsedDDL, out_dir: Path | None = None)
         ],
     }
     path = out_dir / f"{schema}_manual.json"
+    if path.exists():
+        existing = load_manual(path)
+        tables = existing.setdefault("tables", {})
+        for name, fresh in tpl["tables"].items():
+            cur = tables.setdefault(name, {})
+            for k, v in fresh.items():
+                cur.setdefault(k, v)
+        existing.setdefault("schema", schema)
+        existing.setdefault("slow_queries", [])
+        tpl = existing
     path.write_text(
         json.dumps(tpl, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -152,6 +177,9 @@ def generate_fill_sheet(parsed: dict, out_dir: Path | None = None) -> Path:
     """
     out_dir = out_dir or PROFILES_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "fill_sheet.md"
+    # 重跑时保留已填的格子(按 库/表 对齐);新增表追加空行
+    filled = _read_sheet_cells(out.read_text(encoding="utf-8")) if out.exists() else {}
     lines = [
         "# OB 表规模画像填报表",
         "",
@@ -170,68 +198,63 @@ def generate_fill_sheet(parsed: dict, out_dir: Path | None = None) -> Path:
             low = tb.name.lower()
             if "temp" in low or "tmp" in low:
                 continue
-            lines.append(f"| {tb.name} |  |  |  |  |  |")
+            cells = filled.get((schema, tb.name)) or [""] * 5
+            cells = (cells + [""] * 5)[:5]
+            lines.append(f"| {tb.name} |" + "".join(f" {c} |" if c else "  |" for c in cells))
         lines.append("")
     lines += [
         "# 慢查询不再填本表:请单独导入文件(CSV/JSON/纯文本 SQL 均可):",
         "# uv run atlas collect --import-slow <文件> [--schema 库名]",
     ]
-    out = out_dir / "fill_sheet.md"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
 
 
-def import_fill_sheet(path: Path, parsed: dict, out_dir: Path | None = None) -> list[Path]:
-    """解析填好的 md → 各库 *_manual.json(与人工 JSON 模板同构,audit 直接可用)。"""
-    import re as _re
-
-    out_dir = out_dir or PROFILES_DIR
-    text = path.read_text(encoding="utf-8")
-    written: list[Path] = []
+def _read_sheet_cells(text: str) -> dict[tuple[str, str], list[str]]:
+    """填报表 → {(库, 表): [行数, 数据长度, 索引长度, 自增值, 备注]}(原样字符串)。"""
+    out: dict[tuple[str, str], list[str]] = {}
     section: str | None = None
-    # 表行:{schema: {table: {row_count, data_length, index_length, auto_inc}}}
-    fills: dict[str, dict[str, dict]] = {}
-    slow_rows: list[dict] = []
     for line in text.splitlines():
-        m = _re.match(r"^##\s+(\S+)\s*$", line.strip())
+        m = re.match(r"^##\s+(\S+)\s*$", line.strip())
         if m:
             section = m.group(1)
             continue
-        if not line.strip().startswith("|"):
+        if section is None or not line.strip().startswith("|"):
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) < 2 or set(cells[0]) <= set("-: ") or cells[0] in ("表名", "库"):
             continue
-        if section and "慢查询" in section:
-            continue  # 已废弃:慢查询走 --import-slow 文件通道
-        schema = section
-        if schema not in parsed:
-            continue
-        table = cells[0]
+        out[(section, cells[0])] = cells[1:]
+    return out
+
+
+def import_fill_sheet(path: Path, parsed: dict, out_dir: Path | None = None) -> list[Path]:
+    """解析填好的 md → 各库 *_manual.json(与人工 JSON 模板同构,audit 直接可用)。
+
+    按字段合并:只写填了数的格子,不动该表的 index_cardinality/column_stats 等其它键。
+    """
+    out_dir = out_dir or PROFILES_DIR
+    written: list[Path] = []
+    fills: dict[str, dict[str, dict]] = {}
+    keys = ("row_count", "data_length", "index_length", "auto_inc_value")
+    for (schema, table), cells in _read_sheet_cells(path.read_text(encoding="utf-8")).items():
+        if "慢查询" in schema or schema not in parsed:
+            continue  # 慢查询走 --import-slow 文件通道
         if table not in {t.name for t in parsed[schema].tables}:
             continue
-        entry = fills.setdefault(schema, {}).setdefault(table, {})
-        entry["row_count"] = _num(cells[1]) if len(cells) > 1 else None
-        entry["data_length"] = _num(cells[2]) if len(cells) > 2 else None
-        entry["index_length"] = _num(cells[3]) if len(cells) > 3 else None
-        entry["auto_inc_value"] = _num(cells[4]) if len(cells) > 4 else None
+        vals = {k: _num(c) for k, c in zip(keys, cells)}
+        vals = {k: v for k, v in vals.items() if v is not None}
+        if vals:
+            fills.setdefault(schema, {})[table] = vals
     for schema, tables in fills.items():
-        if not tables:
-            continue
-        tpl = json.loads(
-            (out_dir / f"{schema}_manual.json").read_text(encoding="utf-8")
-        ) if (out_dir / f"{schema}_manual.json").exists() else {
+        mp = out_dir / f"{schema}_manual.json"
+        tpl = load_manual(mp) if mp.exists() else {
             "schema": schema, "tables": {}, "slow_queries": []
         }
-        tpl["tables"].update(tables)
-        by_schema_slow = [s for s in slow_rows if s["schema"] == schema]
-        if by_schema_slow:
-            tpl["slow_queries"] = by_schema_slow
-        out = out_dir / f"{schema}_manual.json"
-        out.write_text(
-            json.dumps(tpl, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        written.append(out)
+        for table, vals in tables.items():
+            tpl.setdefault("tables", {}).setdefault(table, {}).update(vals)
+        mp.write_text(json.dumps(tpl, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        written.append(mp)
     return written
 
 
@@ -253,48 +276,61 @@ def _num(v: str):
 # ---------------------------------------------------------------------------
 
 def parse_slow_file(path: Path) -> list[dict]:
-    """宽容解析:JSON(数组或 {"slow_queries": [...]})/ CSV(含 sql 列)/
-    纯文本(按空行或行尾分号分条,无统计字段)。"""
+    """宽容解析:JSON(数组 / {"slow_queries": [...]} / 每行一个对象)/ CSV(含 sql 列,
+    支持 Excel 导出的 BOM 与引号内换行)/ 纯文本(按空行或行尾分号分条,无统计字段)。"""
     import csv
-    import re as _re_mod
+    import io
 
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    if not text.strip():
+        return []
     suffix = path.suffix.lower()
-    rows: list[dict] = []
-    if suffix == ".json" or text.lstrip().startswith(("{", "[")):
-        data = json.loads(text)
-        items = data.get("slow_queries") if isinstance(data, dict) else data
-        for it in items or []:
-            rows.append({
-                "schema": it.get("schema"), "sql": it.get("sql") or it.get("query") or "",
-                "freq": _num(str(it.get("freq") or "")),
-                "avg_ms": _num(str(it.get("avg_ms") or it.get("avg_latency_ms") or "")),
-                "rows_scanned": _num(str(it.get("rows_scanned") or "")),
-                "rows_returned": _num(str(it.get("rows_returned") or "")),
-            })
+    if suffix in (".json", ".jsonl", ".ndjson") or text.lstrip().startswith(("{", "[")):
+        try:
+            data = json.loads(text)
+            items = data.get("slow_queries") if isinstance(data, dict) else data
+        except json.JSONDecodeError:  # NDJSON:每行一个对象
+            items = [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+        rows = [_slow_row(it.get("schema"), it.get("sql") or it.get("query"), it)
+                for it in items or [] if isinstance(it, dict)]
         return [r for r in rows if r["sql"]]
-    if suffix == ".csv" or ("," in text.splitlines()[0] and "sql" in text.splitlines()[0].lower()):
-        reader = csv.DictReader(text.splitlines())
-        for it in reader:
+    header = [c.strip().lower() for c in next(csv.reader([text.splitlines()[0]]))]
+    if suffix == ".csv" or "sql" in header:
+        rows = []
+        for it in csv.DictReader(io.StringIO(text)):
             low = {k.strip().lower(): (v or "").strip() for k, v in it.items() if k}
             if not low.get("sql"):
                 continue
-            rows.append({
-                "schema": low.get("schema") or low.get("库") or low.get("库名"),
-                "sql": low.get("sql"),
-                "freq": _num(low.get("freq") or low.get("频次") or ""),
-                "avg_ms": _num(low.get("avg_ms") or low.get("平均耗时ms") or low.get("耗时ms") or ""),
-                "rows_scanned": _num(low.get("rows_scanned") or low.get("扫描行数") or ""),
-                "rows_returned": _num(low.get("rows_returned") or low.get("返回行数") or ""),
-            })
+            rows.append(_slow_row(
+                low.get("schema") or low.get("库") or low.get("库名"), low.get("sql"), {
+                    "freq": low.get("freq") or low.get("频次"),
+                    "avg_ms": low.get("avg_ms") or low.get("平均耗时ms") or low.get("耗时ms"),
+                    "rows_scanned": low.get("rows_scanned") or low.get("扫描行数"),
+                    "rows_returned": low.get("rows_returned") or low.get("返回行数"),
+                }))
         return rows
-    # 纯文本:按空行分条(行尾分号不强求)
-    for block in _re_mod.split(r"\n\s*\n", text):
+    # 纯文本:按空行或行尾分号分条
+    rows = []
+    for block in re.split(r";[ \t]*(?:\n|$)|\n\s*\n", text):
         sql = block.strip()
         if sql and any(k in sql.upper() for k in ("SELECT", "INSERT", "UPDATE", "DELETE")):
-            rows.append({"schema": None, "sql": sql, "freq": None,
-                         "avg_ms": None, "rows_scanned": None, "rows_returned": None})
+            rows.append(_slow_row(None, sql, {}))
     return rows
+
+
+def _slow_row(schema, sql, it: dict) -> dict:
+    def num(k, *alts):
+        for key in (k, *alts):
+            v = it.get(key)
+            if v not in (None, ""):
+                return _num(str(v))
+        return None
+
+    return {
+        "schema": schema, "sql": sql or "",
+        "freq": num("freq"), "avg_ms": num("avg_ms", "avg_latency_ms"),
+        "rows_scanned": num("rows_scanned"), "rows_returned": num("rows_returned"),
+    }
 
 
 def import_slow_queries(
@@ -346,11 +382,12 @@ def import_slow_queries(
 
 
 def _sql_tables(sql: str) -> set[str]:
-    import re as _re
-
     try:
         st = sqlglot.parse_one(sql, dialect="mysql")
+    except sqlglot.errors.ParseError:
+        st = None
+    if st is not None:
         return {t_.name.lower() for t_ in st.find_all(sqlglot.exp.Table) if t_.name}
-    except Exception:
-        pat = _re.compile(r"(?:FROM|JOIN|INTO|UPDATE)\s+[`]?([a-zA-Z_][a-zA-Z0-9_]*)", _re.I)
-        return {m.lower() for m in pat.findall(sql)}
+    # 解析不了才退回正则:库名限定 db.t 取表名段
+    pat = re.compile(r"\b(?:FROM|JOIN|INTO|UPDATE)\s+`?(\w+)`?(?:\.`?(\w+)`?)?", re.I)
+    return {(t or s_).lower() for s_, t in pat.findall(sql)}

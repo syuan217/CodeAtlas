@@ -7,6 +7,7 @@ ddl_tables.name 存 "{schema}.{table}" 以支持多库(§7 的 UNIQUE 约束保�
 
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -64,6 +65,48 @@ def scrub_ob_options(sql: str) -> str:
     return s
 
 
+def _strip_table_options(sql: str) -> str:
+    """CREATE TABLE t (...) <表选项 / PARTITION BY ...> → 只保留到列定义的右括号。
+
+    sqlglot 不认识 OB 的分区写法(HASH ... PARTITIONS n 等)与部分表选项时会
+    静默降级为 Command(表直接丢失);体检只需列与索引,截掉括号后的部分即可。
+    """
+    depth, quote, i = 0, None, 0
+    while i < len(sql):
+        ch = sql[i]
+        if quote:
+            if ch == "\\" and quote != "`":
+                i += 2
+                continue
+            if ch == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote:  # '' / `` 转义
+                    i += 2
+                    continue
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return sql[: i + 1]
+        i += 1
+    return sql
+
+
+def _parse_create(sql: str):
+    """解析单条 CREATE TABLE;整句不认识时截掉表选项再试。返回 exp.Create 或 None。"""
+    for text in (sql, _strip_table_options(sql)):
+        try:
+            st = sqlglot.parse_one(text, dialect="mysql")
+        except Exception:
+            continue
+        if isinstance(st, exp.Create):
+            return st
+    return None
+
+
 def load_ddl_text(path: Path) -> str:
     """`.md`(提取 ```sql 块)或 `.sql`(全文)。"""
     text = path.read_text(encoding="utf-8", errors="replace")
@@ -92,10 +135,15 @@ def parse_ddl(schema: str, sql_text: str) -> ParsedDDL:
     失败再按 CREATE TABLE 边界降级逐块解析,块级失败只记不炸。"""
     out = ParsedDDL(schema=schema)
     statements = None
+    sqlglot_log = logging.getLogger("sqlglot")
+    level = sqlglot_log.level
+    sqlglot_log.setLevel(logging.ERROR)  # 降级为 Command 的告警由下面显式处理,不刷屏
     try:
         statements = sqlglot.parse(scrub_ob_options(sql_text), dialect="mysql")
     except Exception:
         statements = None
+    finally:
+        sqlglot_log.setLevel(level)
     if statements is None:
         chunks = re.split(r"(?=CREATE TABLE)", sql_text, flags=re.I)
         # 清理 markdown fence 残留(``` 行)与标题行
@@ -104,24 +152,26 @@ def parse_ddl(schema: str, sql_text: str) -> ParsedDDL:
         for chunk in chunks:
             if not re.match(r"CREATE TABLE", chunk.strip(), re.I):
                 continue
-            try:
-                st = sqlglot.parse(scrub_ob_options(chunk), dialect="mysql")[0]
-                statements.append(st)
-            except Exception:
+            st = _parse_create(scrub_ob_options(chunk.strip().rstrip(";")))
+            if st is None:
                 out.failures.append(chunk.strip()[:80])
+            else:
+                statements.append(st)
         return _from_statements(out, statements)
 
     stmts = []
     for st in statements:
         if st is None:
             continue
-        chunk_ok = True
-        try:
-            stmts.append(st)
-        except Exception:  # pragma: no cover
-            chunk_ok = False
-        if not chunk_ok:
-            out.failures.append("unknown")
+        if isinstance(st, exp.Command):
+            text = st.sql(dialect="mysql")
+            if re.match(r"\s*CREATE\s+TABLE", text, re.I):
+                fixed = _parse_create(text)
+                if fixed is None:
+                    out.failures.append(text.strip()[:80])  # 记失败,不静默丢表
+                    continue
+                st = fixed
+        stmts.append(st)
     return _from_statements(out, stmts)
 
 
@@ -134,38 +184,47 @@ def _from_statements(out: ParsedDDL, statements: list) -> ParsedDDL:
             tbl = stmt.find(exp.Table)
             if tbl is None or not isinstance(schema_node, exp.Schema):
                 continue
-            table = Table(name=tbl.name, ddl_text=stmt.sql(dialect="mysql"))
+            # 名字统一小写:MySQL/OB 列名不区分大小写,代码 SQL 提取侧也是小写
+            table = Table(name=tbl.name.lower(), ddl_text=stmt.sql(dialect="mysql"))
             pk_cols: set[str] = set()
             body = list(schema_node.expressions)
             for e in body:
                 if isinstance(e, exp.PrimaryKey):
                     pk_cols = {
-                        i.this for i in e.expressions if isinstance(i, exp.Identifier)
+                        i.this.lower() for i in e.expressions if isinstance(i, exp.Identifier)
+                    } | {
+                        o.name.lower() for o in e.expressions
+                        if isinstance(o, (exp.Ordered, exp.Column)) and o.name
                     }
             for e in body:
                 if isinstance(e, exp.ColumnDef):
+                    inline_pk = any(
+                        isinstance(c.kind, exp.PrimaryKeyColumnConstraint)
+                        for c in (e.args.get("constraints") or [])
+                        if isinstance(c, exp.ColumnConstraint)
+                    )
                     table.columns.append(
                         Column(
-                            name=e.name,
+                            name=e.name.lower(),
                             data_type=_column_type(e),
-                            nullable=_column_nullable(e),
-                            is_pk=e.name in pk_cols,
+                            nullable=_column_nullable(e) and not inline_pk,
+                            is_pk=inline_pk or e.name.lower() in pk_cols,
                         )
                     )
             for e in body:
                 if isinstance(e, exp.IndexColumnConstraint):
-                    cols = [c.name for c in e.find_all(exp.Ordered) if c.name]
+                    cols = [c.name.lower() for c in e.find_all(exp.Ordered) if c.name]
                     if not cols:
-                        cols = [c.name for c in e.find_all(exp.Column) if c.name]
+                        cols = [c.name.lower() for c in e.find_all(exp.Column) if c.name]
                     table.indexes.append(
                         Index(name=e.name or f"idx_{table.name}", columns=cols)
                     )
                 elif isinstance(e, exp.UniqueColumnConstraint):
                     # 结构:this=Schema(this=Identifier(索引名), expressions=[列...])
-                    cols = [c.name for c in e.find_all(exp.Column) if c.name]
+                    cols = [c.name.lower() for c in e.find_all(exp.Column) if c.name]
                     if not cols:
                         cols = [
-                            i.name
+                            i.name.lower()
                             for i in (e.this.expressions if isinstance(e.this, exp.Schema) else [])
                             if isinstance(i, exp.Identifier)
                         ]
@@ -195,8 +254,11 @@ def load_ddl_dir(ddl_dir: Path) -> dict[str, ParsedDDL]:
 
 def persist_ddl(conn: sqlite3.Connection, parsed: ParsedDDL) -> None:
     """写库(幂等:先清该 schema 的旧记录)。name 存 schema.table。"""
-    prefix = f"{parsed.schema}.%"
-    conn.execute("DELETE FROM ddl_tables WHERE name LIKE ?", (prefix,))
+    prefix = f"{parsed.schema}."
+    # 不用 LIKE:schema 名里的 _ 是通配符(a_b 会误删 axb 的表)
+    conn.execute(
+        "DELETE FROM ddl_tables WHERE substr(name, 1, ?) = ?", (len(prefix), prefix)
+    )
     for t in parsed.tables:
         full = f"{parsed.schema}.{t.name}"
         cur = conn.execute(

@@ -11,6 +11,7 @@ import httpx
 
 from codeatlas.config import Settings, content_hash, get_settings, lookup_embed_price
 from codeatlas.cost import log_usage
+from codeatlas.db.models import in_chunks
 from codeatlas.providers._retry import CostTracker, ProviderError, post_with_retry
 
 
@@ -95,21 +96,23 @@ class EmbeddingProvider:
         hashes = [content_hash(t) for t in final_texts]
         vectors: dict[int, bytes] = {}
 
-        # 1) 缓存命中(命中即跳过,不发请求)
+        # 1) 缓存命中(命中即跳过,不发请求);IN 分片,防超 SQLite 变量上限
         miss_idx = list(range(len(texts)))
         if self.conn is not None and texts:
-            ph = ",".join("?" * len(hashes))
-            rows = self.conn.execute(
-                f"SELECT content_hash, vector FROM embed_cache "
-                f"WHERE model=? AND content_hash IN ({ph})",
-                [self.s.embed_model, *hashes],
-            ).fetchall()
-            hit = {r["content_hash"]: r["vector"] for r in rows}
+            hit: dict[str, bytes] = {}
+            for part in in_chunks(sorted(set(hashes))):
+                ph = ",".join("?" * len(part))
+                for r in self.conn.execute(
+                    f"SELECT content_hash, vector FROM embed_cache "
+                    f"WHERE model=? AND content_hash IN ({ph})",
+                    [self.s.embed_model, *part],
+                ):
+                    hit[r["content_hash"]] = r["vector"]
             miss_idx = [i for i, h in enumerate(hashes) if h not in hit]
             vectors = {i: hit[h] for i, h in enumerate(hashes) if h in hit}
 
-        # 2) 未命中分批请求
-        total_tokens = 0
+        # 2) 未命中分批请求;每批完成即校验 → 回写缓存 → 记费用 → 过费用护栏。
+        #    中断/失败时已完成批次不丢(重跑命中缓存不重复付费),超限立即停。
         if miss_idx:
             url = self.s.embed_base_url.rstrip("/") + "/embeddings"
             headers = {"Authorization": f"Bearer {self.s.embed_api_key}"}
@@ -117,13 +120,24 @@ class EmbeddingProvider:
             batches = [
                 miss_idx[i:i + batch_size] for i in range(0, len(miss_idx), batch_size)
             ]
+            price = lookup_embed_price(self.s.embed_model, self.s)
+            stop = asyncio.Event()  # 任一批失败/超限 → 尚未发出的批次不再发
 
-            async def run_batch(idxs: list[int]) -> tuple[list[dict], int]:
+            async def run_batch(idxs: list[int]) -> None:
+                try:
+                    await _run_batch(idxs)
+                except BaseException:
+                    stop.set()
+                    raise
+
+            async def _run_batch(idxs: list[int]) -> None:
                 payload = {
                     "model": self.s.embed_model,
                     "input": [final_texts[i] for i in idxs],
                 }
                 async with self._sem:
+                    if stop.is_set():
+                        return
                     resp = await post_with_retry(
                         self._ensure_client(),
                         url,
@@ -133,22 +147,19 @@ class EmbeddingProvider:
                     )
                     if self.s.embed_batch_delay_ms:
                         await asyncio.sleep(self.s.embed_batch_delay_ms / 1000)
-                data = resp.json()
-                usage = data.get("usage") or {}
-                return data.get("data") or [], int(usage.get("total_tokens", 0))
-
-            results = await asyncio.gather(*[run_batch(b) for b in batches])
-
-            # 3) 对齐校验(维度/有限值)+ 回写缓存;gather 保序,可按批次 zip
-            cache_rows: list[tuple] = []
-            for idxs, (items, tokens) in zip(batches, results):
-                total_tokens += tokens
+                try:
+                    data = resp.json()
+                except ValueError as e:
+                    raise ProviderError(f"embedding 响应不是 JSON: {resp.text[:300]}") from e
+                items = data.get("data") or []
+                tokens = int((data.get("usage") or {}).get("total_tokens", 0))
                 if len(items) != len(idxs):
                     raise ProviderError(
                         f"embedding 返回条数 {len(items)} ≠ 请求条数 {len(idxs)}"
                     )
-                for item in items:
-                    i = idxs[item["index"]]
+                cache_rows: list[tuple] = []
+                for pos, item in enumerate(items):
+                    i = idxs[item.get("index", pos)]
                     vec = item["embedding"]
                     if len(vec) != self.s.embed_dim:
                         raise ProviderError(
@@ -161,29 +172,32 @@ class EmbeddingProvider:
                     blob = pack_vector(vec)
                     vectors[i] = blob
                     cache_rows.append((hashes[i], self.s.embed_model, self.s.embed_dim, blob))
+                cost = tokens / 1e6 * price if price is not None else 0.0
+                if self.conn is not None:
+                    self.conn.executemany(
+                        "INSERT OR REPLACE INTO embed_cache(content_hash, model, dim, vector) "
+                        "VALUES(?,?,?,?)",
+                        cache_rows,
+                    )
+                    if tokens:
+                        log_usage(  # 内含 commit,缓存行随之落盘
+                            self.conn, stage=stage, repo_id=repo_id,
+                            model=self.s.embed_model, prompt_tokens=tokens,
+                            completion_tokens=0, cost=cost,
+                        )
+                    else:
+                        self.conn.commit()
+                self.tracker.add(cost, f"embed {self.s.embed_model}")
 
-            if self.conn is not None and cache_rows:
-                self.conn.executemany(
-                    "INSERT OR REPLACE INTO embed_cache(content_hash, model, dim, vector) "
-                    "VALUES(?,?,?,?)",
-                    cache_rows,
-                )
-                self.conn.commit()
-
-            # 4) 费用落库(usage_log)
-            price = lookup_embed_price(self.s.embed_model, self.s)
-            cost = total_tokens / 1e6 * price if price is not None else 0.0
-            if self.conn is not None and total_tokens:
-                log_usage(
-                    self.conn,
-                    stage=stage,
-                    repo_id=repo_id,
-                    model=self.s.embed_model,
-                    prompt_tokens=total_tokens,
-                    completion_tokens=0,
-                    cost=cost,
-                )
-            self.tracker.add(cost, f"embed {self.s.embed_model}")
+            tasks = [asyncio.ensure_future(run_batch(b)) for b in batches]
+            try:
+                await asyncio.gather(*tasks)
+            except BaseException:
+                # 任一批失败/超限/被取消:撤掉其余批次,别在后台继续花钱
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
 
         return [vectors[i] for i in range(len(texts))]
 

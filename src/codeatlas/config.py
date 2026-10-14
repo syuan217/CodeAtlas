@@ -94,6 +94,9 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = ""
     llm_context_window: int = 128000
+    # 关闭思考时发送 thinking:{type:disabled}(GLM 系语义);OpenAI 官方等
+    # 不认识未知参数会返回 400,此时在 .env 设 LLM_THINKING_CONTROL=false
+    llm_thinking_control: bool = True
     # 单价覆盖(元/1M tokens);不设则查内置单价表,再查不到记 cost=0(unknown)
     llm_price_prompt: float | None = None
     llm_price_completion: float | None = None
@@ -117,8 +120,6 @@ class Settings(BaseSettings):
     chunk_max_tokens: int = 512
     sim_threshold: float = 0.25
     vector_top_k: int = 20
-    context_top_n: int = 8
-    rerank_enabled: bool = False
     graph_expand_hops: int = 2
 
 

@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 import codeatlas.cli as cli_mod
 from codeatlas import config as config_mod
 from codeatlas.config import Settings
-from codeatlas.db.models import connect, init_db
+from codeatlas.db.models import SCHEMA_VERSION, connect, init_db
 from codeatlas.cost import log_usage
 
 runner = CliRunner()
@@ -131,7 +131,7 @@ def test_json_outputs(isolated_db):
     r = runner.invoke(cli_mod.app, ["status", "--json"])
     assert r.exit_code == 0
     data = _json.loads(r.output)
-    assert data["schema_version"] == "1"
+    assert data["schema_version"] == str(SCHEMA_VERSION)
     assert "counts" in data and "repos" in data
     assert "┌" not in r.output  # 无表格框线
 
@@ -197,3 +197,121 @@ def test_session_reader_tty_uses_prompt_toolkit(monkeypatch):
     read = cli_mod._make_session_reader()
     assert asyncio.run(read()) == "中文输入"
     assert seen["prompt"] == "❯ "
+
+
+def test_trim_history_zero_keeps_no_pairs():
+    msgs = [{"role": "system", "content": "sys"},
+            {"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    assert cli_mod._trim_history(msgs, 0) == [{"role": "system", "content": "sys"}]
+
+
+def _fake_session(monkeypatch, questions, run_impl):
+    """装配假会话环境:脚本化输入 + 假 run_agent,返回控制台输出收集器。"""
+
+    from codeatlas.agent import loop as loop_mod
+
+    class _Closable:
+        async def aclose(self):
+            pass
+
+    class _Conn:
+        def close(self):
+            pass
+
+    class _TB:
+        calls: list = []
+
+        def reset(self):
+            pass
+
+    monkeypatch.setattr(cli_mod, "_agent_env",
+                        lambda repo: (_Conn(), _TB(), None, _Closable()))
+    it = iter(questions)
+
+    def _reader():
+        async def _read():
+            try:
+                return next(it)
+            except StopIteration:
+                raise EOFError from None
+        return _read
+
+    monkeypatch.setattr(cli_mod, "_make_session_reader", _reader)
+    monkeypatch.setattr(loop_mod, "run_agent", run_impl)
+    out: list[str] = []
+    monkeypatch.setattr(cli_mod.console, "print",
+                        lambda *a, **k: out.append(
+                            " ".join(str(getattr(x, "renderable", x)) for x in a)))
+    return out
+
+
+def _answer(text):
+    from codeatlas.agent.loop import AgentResult
+
+    return AgentResult(answer=text, messages=[
+        {"role": "system", "content": "s"}, {"role": "user", "content": "q"},
+        {"role": "assistant", "content": text}])
+
+
+def test_agent_session_ctrl_c_interrupts_only_current_question(monkeypatch):
+    """思考中 Ctrl-C:只中断本问,会话继续(asyncio 下 SIGINT 表现为 CancelledError)。"""
+    import asyncio
+    import os
+    import signal
+
+    calls = {"n": 0}
+
+    async def fake_run(question, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            os.kill(os.getpid(), signal.SIGINT)
+            await asyncio.sleep(5)
+        return _answer(f"答:{question}")
+
+    out = _fake_session(monkeypatch, ["第一问", "第二问"], fake_run)
+    asyncio.run(cli_mod._agent_session(None, None, 6, 8))
+    joined = "\n".join(out)
+    assert "已中断本问" in joined
+    assert "答:第二问" in joined
+    assert "会话关闭" in joined
+
+
+def test_agent_session_provider_error_keeps_session(monkeypatch):
+    import asyncio
+
+    from codeatlas.providers._retry import ProviderError
+
+    calls = {"n": 0}
+
+    async def fake_run(question, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ProviderError("POST 返回 400")
+        return _answer(f"答:{question}")
+
+    out = _fake_session(monkeypatch, ["第一问", "第二问"], fake_run)
+    asyncio.run(cli_mod._agent_session(None, None, 6, 8))
+    joined = "\n".join(out)
+    assert "400" in joined and "答:第二问" in joined
+
+
+def test_agent_env_without_embedding_uses_local_search(isolated_db, monkeypatch, tmp_path):
+    """未配置 embedding:search 工具走 FTS+符号,而不是每次报 Embedding 未配置。"""
+    import asyncio
+
+    from codeatlas.config import RepoCfg
+    from codeatlas.ingest.indexer import index_repo
+    from conftest import copy_fixture
+
+    s = Settings(_env_file=None, llm_base_url="http://llm.test/v1", llm_api_key="k",
+                 llm_model="m", embed_dim=4)
+    monkeypatch.setattr(cli_mod, "get_settings", lambda: s)
+    index_repo(RepoCfg(name="jmini", path=copy_fixture("java_mini", tmp_path)),
+               settings=s, conn=isolated_db, no_embed=True)
+    conn, toolbox, embedder, llm = cli_mod._agent_env(None)
+    try:
+        assert embedder is None
+        out = asyncio.run(toolbox.execute("search", {"query": "truncate"}))
+        assert "Strings.java" in out and "出错" not in out
+    finally:
+        conn.close()

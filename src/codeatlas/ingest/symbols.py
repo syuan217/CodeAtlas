@@ -7,7 +7,7 @@ package/import 原始信息(IMPORTS 两阶段解析的 Pass1 输入)。
 
 qualified_name 约定:容器层级用 '.',方法用 '#'(如 com.x.OrderService#create,
 PLAN §7 示例);module 符号的 qualified_name = 仓库内相对路径(全局唯一)。
-同文件内重名(如 Java 重载)追加 "@行号" 消歧,保证 UNIQUE(repo_id, qualified_name)。
+同文件内重名(如 Java 重载)追加 "@行号" 消歧;跨文件同名(多模块同 FQCN)允许并存,由解析器按歧义处理。
 """
 
 from __future__ import annotations
@@ -42,6 +42,26 @@ def detect_language(rel: str) -> str | None:
     return EXT_LANG.get(Path(rel).suffix.lower())
 
 
+def decode_source(raw: bytes) -> str:
+    """源码字节 → 文本:UTF-8(含 BOM)优先,失败按 GB18030(GBK 超集,国内老项目常见),
+    再不行才按 UTF-8 替换非法字节。换行字节在三者中一致,行号不受影响。"""
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _utf8_source(raw: bytes) -> bytes:
+    """统一转 UTF-8 后再交给 tree-sitter:节点 .text.decode() 才不会因 GBK 字节抛错。"""
+    try:
+        raw.decode("utf-8")
+        return raw
+    except UnicodeDecodeError:
+        return decode_source(raw).encode("utf-8")
+
+
 @dataclass
 class Symbol:
     kind: str  # module / class / interface / function / method
@@ -51,7 +71,8 @@ class Symbol:
     line_end: int
     signature: str | None
     parent: int | None  # FileSymbols.symbols 内的父符号索引;None = 挂 module
-    javadoc_start: int | None = None  # 紧邻注释块起始行(class chunk 用)
+    javadoc_start: int | None = None  # 紧邻注释块起始行(切块时并入)
+    lead_start: int | None = None  # 前导注解/装饰器起始行(早于 line_start 时才有;切块时并入)
 
 
 @dataclass
@@ -111,10 +132,15 @@ class _Collector:
         *,
         with_comment: bool = False,
         line_override: int | None = None,
+        lead_line: int | None = None,
     ) -> int:
         sr, _, er, _ = _range(node)
+        lead = lead_line
         if line_override is not None:
-            # Java 注解使节点起点落在注解行;行号/签名统一用签名行(验收 #27/#28/#33)
+            # Java 注解使节点起点落在注解行;行号/签名统一用签名行(验收 #27/#28/#33),
+            # 注解行另记 lead_start,切块时并入(@PostMapping 等是检索要命中的内容)
+            if sr + 1 < line_override:
+                lead = sr + 1
             sr = line_override - 1
         sym = Symbol(
             kind=kind,
@@ -125,12 +151,13 @@ class _Collector:
             signature=_signature(self.lines, sr),
             parent=parent,
             javadoc_start=_comment_start(node, self.lines) if with_comment else None,
+            lead_start=lead if lead is not None and lead < sr + 1 else None,
         )
         self.symbols.append(sym)
         return len(self.symbols) - 1
 
     def dedup_qnames(self) -> None:
-        """同文件重名符号(Java 重载等)加 @行号 后缀,保证唯一索引安全。"""
+        """同文件重名符号(Java 重载等)加 @行号 后缀,文件内限定名唯一。"""
         seen: set[str] = set()
         for s in self.symbols:
             q = s.qualified_name
@@ -197,7 +224,7 @@ def _extract_java(
                 name = name_node.text.decode("utf-8")
                 kind = "method"
                 qname = f"{prefix.rstrip('.') or 'root'}#{name}"
-                col.add(child, kind, name, qname, parent,
+                col.add(child, kind, name, qname, parent, with_comment=True,
                         line_override=name_node.start_point[0] + 1)
             elif t in _JAVA_TRANSPARENT:
                 walk(child, prefix, parent)
@@ -224,6 +251,14 @@ _PY_FROM_RE = re.compile(r"^from\s+(\.+)?([\w.]*)\s+import\s+(.+)$")
 _PY_IMPORT_RE = re.compile(r"^import\s+([\w.,\s]+)")
 # block 是 class body(要穿透)也是函数体(函数分支不递归,天然剪枝)
 _PY_TRANSPARENT = {"block"}
+
+
+def _py_decorator_line(node) -> int | None:
+    """被装饰的 def/class:装饰器起始行(decorated_definition 节点起点)。"""
+    parent = node.parent
+    if parent is not None and parent.type == "decorated_definition":
+        return parent.start_point[0] + 1
+    return None
 
 
 def _extract_python(
@@ -273,16 +308,19 @@ def _extract_python(
             elif t == "class_definition":
                 name = child.child_by_field_name("name").text.decode("utf-8")
                 qname = f"{prefix}{name}"
-                idx = col.add(child, "class", name, qname, parent, with_comment=True)
+                idx = col.add(child, "class", name, qname, parent, with_comment=True,
+                              lead_line=_py_decorator_line(child))
                 walk(child, f"{qname}.", idx, True)
             elif t == "function_definition":
                 name = child.child_by_field_name("name").text.decode("utf-8")
                 if in_class:
                     qname = f"{prefix.rstrip('.')}#{name}"
-                    col.add(child, "method", name, qname, parent)
+                    col.add(child, "method", name, qname, parent,
+                            lead_line=_py_decorator_line(child))
                 else:
                     qname = f"{prefix}{name}"
-                    col.add(child, "function", name, qname, parent)
+                    col.add(child, "function", name, qname, parent,
+                            lead_line=_py_decorator_line(child))
             elif t == "decorated_definition":
                 walk(child, prefix, parent, in_class)  # 取内层 definition,装饰器行忽略
             elif t in _PY_TRANSPARENT:
@@ -304,6 +342,10 @@ _TS_CLASSY = {
 }
 _TS_FUNCY = {"function_declaration", "generator_function_declaration"}
 _TS_TRANSPARENT = {"class_body", "interface_body", "enum_body"}
+# 赋值形式的函数值(const f = () => {} / 类字段 f = function () {})
+_TS_FUNC_VALUES = {"arrow_function", "function_expression", "function"}
+# 类字段节点:typescript/tsx 为 public_field_definition(name),javascript 为 field_definition(property)
+_TS_FIELD = {"public_field_definition", "field_definition"}
 
 
 def _extract_ts(
@@ -389,6 +431,14 @@ def _extract_ts(
                 name = child.child_by_field_name("name").text.decode("utf-8")
                 qname = f"{prefix.rstrip('.')}#{name}"
                 col.add(child, "method", name, qname, parent)
+            elif t in _TS_FIELD and in_class:
+                # 类字段箭头函数 handleClick = () => {}(React 类组件常见)= 方法
+                name_node = (child.child_by_field_name("name")
+                             or child.child_by_field_name("property"))
+                value = child.child_by_field_name("value")
+                if name_node is not None and value is not None and value.type in _TS_FUNC_VALUES:
+                    name = name_node.text.decode("utf-8")
+                    col.add(child, "method", name, f"{prefix.rstrip('.')}#{name}", parent)
             elif t == "lexical_declaration":
                 # const fn = () => {} / function 表达式(顶层赋值函数)
                 for decl in child.named_children:
@@ -398,7 +448,7 @@ def _extract_ts(
                     value = decl.child_by_field_name("value")
                     if name_node is None or value is None:
                         continue
-                    if value.type in ("arrow_function", "function_expression", "function"):
+                    if value.type in _TS_FUNC_VALUES:
                         name = name_node.text.decode("utf-8")
                         col.add(decl, "function", name, f"{prefix}{name}", parent)
             elif t in _TS_TRANSPARENT:
@@ -486,7 +536,8 @@ def extract_symbols(rel: str, lang: str, source: bytes) -> FileSymbols:
     fs = FileSymbols(rel=rel, lang=lang, module=_module(rel))
     if lang not in SYMBOL_LANGS:
         return fs
-    text = source.decode("utf-8", errors="replace")
+    source = _utf8_source(source)
+    text = source.decode("utf-8")
     lines = text.splitlines()
     try:
         parser = get_parser(lang)
@@ -576,7 +627,10 @@ def _calls_java(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
                         ty = p.child_by_field_name("type")
                         if n is not None and ty is not None:
                             local_vars[n.text.decode()] = _norm_type(ty.text.decode())
-                idx = caller_at.get(child.start_point[0] + 1)
+                # 符号行号取签名(name)行(见 _extract_java 的 line_override);
+                # 按节点起点查会落在注解行,@Override/@Transactional 方法的调用全归 module
+                name_n = child.child_by_field_name("name")
+                idx = caller_at.get((name_n or child).start_point[0] + 1)
                 walk(child, fields, local_vars, idx if idx is not None else caller)
             elif t == "local_variable_declaration":
                 vt = _java_field_type(child)
@@ -641,7 +695,6 @@ def _calls_java(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
 def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
     sites: list[CallSite] = []
     caller_at = _caller_index(fs)
-    lex_names: set[str] = set()  # caller 词法域名字(参数/局部 const 与函数)
 
     def type_of_annotation(node) -> str | None:
         ann = node.child_by_field_name("type_annotation")
@@ -654,23 +707,37 @@ def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
             return None
         return _norm_type(ann.text.decode().lstrip(":").strip())
 
+    def enter_function(fn, key_node, vars_: dict, caller: int | None, lex: set[str]):
+        """进入函数作用域:参数入变量表/词法域副本;caller 按符号建立时所用节点
+        (key_node)的起始行对齐——箭头函数/类字段的符号建在声明节点上,不在函数节点上。"""
+        sub = dict(vars_)
+        sub_lex = set(lex)  # 词法名字进入函数作用域副本
+        params = fn.child_by_field_name("parameters")
+        single = fn.child_by_field_name("parameter")  # x => ... 无括号单参
+        if single is not None:
+            sub_lex.add(_ts_pattern_name(single))
+        if params is not None:
+            for p in params.named_children:
+                n = p if p.type == "identifier" else p.child_by_field_name("pattern")
+                if n is not None:
+                    sub_lex.add(_ts_pattern_name(n))
+                ty = type_of_annotation(p)
+                if n is not None and ty:
+                    sub[_ts_pattern_name(n)] = ty
+        idx = caller_at.get(key_node.start_point[0] + 1)
+        walk(fn, sub, idx if idx is not None else caller, sub_lex)
+
     def walk(node, vars_: dict, caller: int | None, lex: set[str]):
         for child in node.named_children:
             t = child.type
             if t in _TS_FUNCY or t == "method_definition":
-                sub = dict(vars_)
-                sub_lex = set(lex)  # 词法名字进入函数作用域副本
-                params = child.child_by_field_name("parameters")
-                if params is not None:
-                    for p in params.named_children:
-                        n = p.child_by_field_name("pattern")
-                        if n is not None:
-                            sub_lex.add(_ts_pattern_name(n))
-                        ty = type_of_annotation(p)
-                        if n is not None and ty:
-                            sub[_ts_pattern_name(n)] = ty
-                idx = caller_at.get(child.start_point[0] + 1)
-                walk(child, sub, idx if idx is not None else caller, sub_lex)
+                enter_function(child, child, vars_, caller, lex)
+            elif t in _TS_FIELD:
+                value = child.child_by_field_name("value")
+                if value is not None and value.type in _TS_FUNC_VALUES:
+                    enter_function(value, child, vars_, caller, lex)
+                else:
+                    walk(child, vars_, caller, lex)
             elif t in ("class_declaration", "abstract_class_declaration"):
                 sub = dict(vars_)
                 for body in child.named_children:
@@ -698,7 +765,15 @@ def _calls_ts(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
                             ty = _norm_type(ctor.text.decode())
                     if ty:
                         vars_[_ts_pattern_name(n)] = ty  # 原地传播到兄弟节点
-                walk(child, vars_, caller, lex)
+                for decl in child.named_children:
+                    val = (decl.child_by_field_name("value")
+                           if decl.type == "variable_declarator" else None)
+                    if val is not None and val.type in _TS_FUNC_VALUES:
+                        # const f = () => {}:顶层的是符号(caller 对齐到它),
+                        # 函数体内嵌套的不是符号,enter_function 查不到时沿用外层 caller
+                        enter_function(val, decl, vars_, caller, lex)
+                    else:
+                        walk(decl, vars_, caller, lex)
             elif t == "call_expression":
                 fn = child.child_by_field_name("function")
                 recv, name = _ts_call_target(fn)
@@ -769,7 +844,6 @@ def _calls_python(tree, source: bytes, fs: FileSymbols) -> list[CallSite]:
         for child in node.named_children:
             t = child.type
             if t == "class_definition":
-                idx_before = caller
                 walk(child, vars_, caller, True)
             elif t == "function_definition":
                 sub = dict(vars_)
@@ -869,6 +943,7 @@ def extract_call_sites(rel: str, lang: str, source: bytes, fs: FileSymbols) -> l
     """提取单文件调用点;解析失败返回空列表。"""
     if lang not in SYMBOL_LANGS:
         return []
+    source = _utf8_source(source)
     try:
         tree = get_parser(lang).parse(source)
     except Exception:

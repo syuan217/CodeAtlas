@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
+import signal
 import sys
 import time
 from pathlib import Path
@@ -43,6 +43,7 @@ app = typer.Typer(
     context_settings={"help_option_names": ["--help", "-h"]},
 )
 console = Console()
+
 
 
 @app.command()
@@ -180,15 +181,12 @@ async def _doctor() -> None:
         dim = len(blobs[0]) // 4
         vec0 = unpack_vector(blobs[0])
         finite = all(x == x and abs(x) != float("inf") for x in vec0)
-        emb_cost = conn.execute(
-            "SELECT COALESCE(SUM(cost),0) AS c FROM usage_log WHERE stage='doctor' AND model=?",
-            (s.embed_model,),
-        ).fetchone()["c"]
+        emb_cost = emb.tracker.total
         emb_line = (
             f"[green]OK[/green]  模型 {s.embed_model}  维度 {dim}"
             f"(EMBED_DIM={s.embed_dim} {'一致' if dim == s.embed_dim else '[red]不一致[/red]'})  "
             f"耗时 {emb_ms:.0f}ms  数值 {'正常' if finite else '[red]含非有限值[/red]'}  "
-            f"累计费用 {emb_cost:.6f} 元"
+            f"费用 {emb_cost:.6f} 元"
         )
     except (ProviderError, CostLimitExceeded) as e:
         emb_line = f"[red]FAIL[/red]  {e}"
@@ -199,7 +197,7 @@ async def _doctor() -> None:
     env_table.add_row("LLM 端点", llm_line)
     env_table.add_row("Embedding 端点", emb_line)
     console.print(env_table)
-    console.print(f"本次 doctor 最小调用费用合计:{total_cost(conn):.6f} 元")
+    console.print(f"本次 doctor 最小调用费用合计:{llm.tracker.total + emb.tracker.total:.6f} 元")
     conn.close()
     if not ok:
         raise typer.Exit(code=1)
@@ -253,7 +251,7 @@ def index(
             stats = index_repo(r, settings=s, full=full, no_embed=no_embed or not embed_ready)
         except (ProviderError, CostLimitExceeded) as e:
             console.print(f"[red]{r.name} 索引中断:{e}[/red]")
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from None
         console.print(stats.summary_line())
         if stats.mode == "git" and stats.head_commit:
             console.print(f"[dim]indexed_commit → {stats.head_commit[:12]}[/dim]")
@@ -312,23 +310,24 @@ def _agent_env(repo_name: str | None):
     conn = connect()
     init_db(conn)
     repo_id = None
-    repo_root = None
     if repo_name:
-        row = conn.execute("SELECT id, path FROM repos WHERE name=?", (repo_name,)).fetchone()
+        row = conn.execute("SELECT id FROM repos WHERE name=?", (repo_name,)).fetchone()
         if row is None:
             console.print(f"[red]仓库 {repo_name!r} 未索引[/red]")
             conn.close()
             raise typer.Exit(code=1)
-        repo_id, repo_root = row["id"], Path(row["path"])
+        repo_id = row["id"]
 
-    lance = LanceStore(s)
-    embedder = EmbeddingProvider(s, conn)
+    # 未配置 embedding 时跳过向量路(与 atlas search 一致),检索走 FTS+符号+图扩展
+    embed_ready = bool(s.embed_base_url and s.embed_api_key and s.embed_model)
+    lance = LanceStore(s) if embed_ready else None
+    embedder = EmbeddingProvider(s, conn) if embed_ready else None
     llm = LLMProvider(s, conn)
 
     async def _retrieve(query: str):
         return await retrieve(query, s, conn, embedder, lance, repo_id=repo_id)
 
-    toolbox = ToolBox(conn, repo_root, repo_id, retriever=_retrieve)
+    toolbox = ToolBox(conn, repo_id, retriever=_retrieve)
     return conn, toolbox, embedder, llm
 
 
@@ -353,7 +352,32 @@ def _trim_history(history: list[dict], keep_pairs: int) -> list[dict]:
     """会话记忆瘦身:保留 system + 最近 keep_pairs 组问答对(组 = user+assistant)。"""
     system = [m for m in history if m["role"] == "system"]
     qa = [m for m in history if m["role"] != "system"]
-    return system + qa[-2 * keep_pairs:]
+    return system + (qa[-2 * keep_pairs:] if keep_pairs > 0 else [])
+
+
+async def _run_interruptible(coro):
+    """跑会话中的一问:Ctrl-C 只取消这一问,返回 None 表示被中断。
+
+    asyncio.run 的默认 SIGINT 处理是取消整个主任务(在协程里表现为 CancelledError,
+    except KeyboardInterrupt 接不住,会话随之结束)。这里把本问包成子任务并临时
+    接管 SIGINT,只取消子任务;平台不支持 add_signal_handler 时保持默认行为。
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(coro)
+    try:
+        loop.add_signal_handler(signal.SIGINT, task.cancel)
+        installed = True
+    except (NotImplementedError, RuntimeError, ValueError):
+        installed = False
+    try:
+        return await task
+    except asyncio.CancelledError:
+        if task.cancelled() and not asyncio.current_task().cancelling():
+            return None
+        raise
+    finally:
+        if installed:
+            loop.remove_signal_handler(signal.SIGINT)
 
 
 def _make_session_reader():
@@ -381,22 +405,43 @@ def _make_session_reader():
     return _read
 
 
-def _resolve_symbol_or_exit(conn, pattern: str, repo: str | None):
+def _resolve_symbol_or_exit(conn, pattern: str, repo: str | None, as_json: bool = False):
     repo_id = None
     if repo:
         row = conn.execute("SELECT id FROM repos WHERE name=?", (repo,)).fetchone()
         if row is None:
-            console.print(f"[red]仓库 {repo!r} 未索引[/red]")
+            if as_json:
+                _emit_json({"error": "repo_not_indexed", "repo": repo})
+            else:
+                console.print(f"[red]仓库 {repo!r} 未索引[/red]")
             raise typer.Exit(code=1)
         repo_id = row["id"]
     syms = find_symbols(conn, pattern, repo_id)
     if not syms:
-        console.print(f"[yellow]未找到符号:{pattern}[/yellow]")
+        if as_json:
+            _emit_json({"error": "not_found", "query": pattern})
+        else:
+            console.print(f"[yellow]未找到符号:{pattern}[/yellow]")
         raise typer.Exit(code=1)
-    if len(syms) > 1 and syms[0]["name"] != pattern and syms[0]["qualified_name"] != pattern:
-        console.print(f"[yellow]{pattern!r} 匹配到 {len(syms)} 个符号,请用完整 qualified_name:[/yellow]")
-        for s in syms[:15]:
-            console.print(f"  {s['qualified_name']}  ({s['fpath']}:{s['line_start']})")
+    if len(syms) > 1:
+        # 多匹配一律报歧义,不猜:结构查询的结论必须确定
+        if as_json:
+            _emit_json({
+                "error": "ambiguous", "query": pattern, "total": len(syms),
+                "candidates": [
+                    {k: s[k] for k in ("qualified_name", "repo", "kind", "fpath", "line_start")}
+                    for s in syms[:30]
+                ],
+            })
+        else:
+            console.print(
+                f"[yellow]{pattern!r} 匹配到 {len(syms)} 个符号,请改用完整 qualified_name"
+                f"(或加 --repo 限定仓库):[/yellow]"
+            )
+            for s in syms[:15]:
+                console.print(
+                    f"  {s['qualified_name']}  [dim]{s['repo']}[/dim]  ({s['fpath']}:{s['line_start']})"
+                )
         raise typer.Exit(code=1)
     return syms[0], repo_id
 
@@ -432,7 +477,7 @@ def definition(
     conn = connect()
     try:
         init_db(conn)
-        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
+        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo, as_json)
         if as_json:
             _emit_json({k: sym[k] for k in
                         ("qualified_name", "kind", "fpath", "line_start", "line_end", "signature")})
@@ -456,7 +501,7 @@ def callers_cmd(
     conn = connect()
     try:
         init_db(conn)
-        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
+        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo, as_json)
         edges = callers_of(conn, sym)
         if as_json:
             _emit_json({"symbol": sym["qualified_name"],
@@ -477,7 +522,7 @@ def callees_cmd(
     conn = connect()
     try:
         init_db(conn)
-        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
+        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo, as_json)
         edges = callees_of(conn, sym)
         if as_json:
             _emit_json({"symbol": sym["qualified_name"],
@@ -499,7 +544,7 @@ def impact(
     conn = connect()
     try:
         init_db(conn)
-        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo)
+        sym, _ = _resolve_symbol_or_exit(conn, symbol, repo, as_json)
         rows = impact_of(conn, sym, max_depth=depth)
         if as_json:
             _emit_json({"symbol": sym["qualified_name"], "impacts": rows})
@@ -582,7 +627,7 @@ def rebuild_calls(
                 ctx = build_context(conn, repo_id)
                 call_files = []
                 for rel in info["rels"]:
-                    cf = light_call_file(conn, cfg, rel)
+                    cf = light_call_file(conn, repo_id, cfg, rel)
                     if cf is not None:
                         call_files.append(cf)
                 stats = resolve_and_write_calls(conn, repo_id, call_files, ctx)
@@ -620,6 +665,9 @@ def collect(
     parsed_all = load_ddl_dir(DDL_DIR)
     if not parsed_all:
         console.print(f"[red]{DDL_DIR} 下没有 DDL 文件(.sql/.md)[/red]")
+        raise typer.Exit(code=1)
+    if schema and schema not in parsed_all:
+        console.print(f"[red]{DDL_DIR} 下没有库 {schema!r}(可选:{', '.join(sorted(parsed_all))})[/red]")
         raise typer.Exit(code=1)
     targets = {schema: parsed_all[schema]} if schema else parsed_all
 
@@ -665,6 +713,7 @@ def audit(
     from codeatlas.config import DDL_DIR, PROFILES_DIR, load_repos
     from codeatlas.ingest.indexer import upsert_repo
     from codeatlas.schema.audit import (
+        merge_slow_query_accesses,
         persist_findings,
         render_report,
         run_audit,
@@ -682,7 +731,7 @@ def audit(
             raise typer.Exit(code=1)
 
         # 1) DDL 入库
-        for schema, p_ in parsed_all.items():
+        for p_ in parsed_all.values():
             persist_ddl(conn, p_)
         total_fail = sum(len(p_.failures) for p_ in parsed_all.values())
         console.print(
@@ -704,6 +753,9 @@ def audit(
         cfgs = load_repos()
         if repos:
             only = {r.strip() for r in repos.split(",")}
+            unknown = only - {c.name for c in cfgs}
+            if unknown:
+                console.print(f"[yellow]repos.yaml 里没有:{', '.join(sorted(unknown))}(已忽略)[/yellow]")
             cfgs = [c for c in cfgs if c.name in only]
         anti_patterns: list[dict] = []
         for cfg in cfgs:
@@ -718,6 +770,12 @@ def audit(
                                           "source_file": q.source_file,
                                           "source_line": q.source_line})
             console.print(f"SQL 提取:{cfg.name}({len(qs)} 条语句)")
+        # 3.5) 慢查询:各库画像里的 slow_queries 的 where/join 列并入访问路径证据
+        # (线上真实查询,IDX001 最硬证据);先清上一轮再写,重跑不翻倍
+        slow_by_schema = merge_slow_query_accesses(conn, list(parsed_all), PROFILES_DIR)
+        n_slow = sum(len(v) for v in slow_by_schema.values())
+        if n_slow:
+            console.print(f"慢查询证据:{n_slow} 条")
         qmap = [
             dict(r)
             for r in conn.execute(
@@ -725,80 +783,6 @@ def audit(
                 "table_name, column_name, usage, freq FROM query_column_map"
             )
         ]
-
-        # 3.5) 慢查询:入库表画像之外的事件数据(独立文件导入);SQL 的
-        # where/join 列并入访问路径证据(线上真实查询,IDX001 最硬证据)
-        from codeatlas.schema.collect_ob import load_manual
-        from codeatlas.schema.sql_extract import (
-            ExtractedQuery,
-            _clean_dynamic,
-            _extract_accesses,
-            _try_parse,
-            fingerprint_sql,
-        )
-
-        slow_by_schema: dict[str, list[dict]] = {}
-        slow_extra_qmap: list[dict] = []
-        for schema in parsed_all:
-            mp = PROFILES_DIR / f"{schema}_manual.json"
-            if not mp.exists():
-                continue
-            data = load_manual(mp)
-            slow = [q for q in (data.get("slow_queries") or []) if q.get("sql")]
-            slow_by_schema[schema] = slow
-            for q in slow:
-                sql = _clean_dynamic(str(q["sql"]))
-                stmt = _try_parse(sql)
-                if stmt is None:
-                    continue
-                tbls, accesses = _extract_accesses(stmt)
-                if not tbls:
-                    continue
-                eq = ExtractedQuery(
-                    source_file=f"slow_query:{schema}", source_line=0, sql=sql[:2000],
-                    fingerprint=fingerprint_sql(sql), tables=tbls, accesses=accesses,
-                )
-                freq = int(q.get("freq") or 1)
-                for a in eq.accesses:
-                    slow_extra_qmap.append({
-                        "query_fingerprint": eq.fingerprint,
-                        "source_file": eq.source_file, "source_line": 0,
-                        "table_name": a.table, "column_name": a.column,
-                        "usage": a.usage, "freq": freq,
-                    })
-        if slow_extra_qmap:
-            conn.execute(
-                "INSERT INTO repos(name, path, languages) "
-                "VALUES('__codeatlas_reports__', '', '[]') "
-                "ON CONFLICT(name) DO UPDATE SET path=''"
-            )
-            sid = conn.execute(
-                "SELECT id FROM repos WHERE name='__codeatlas_reports__'"
-            ).fetchone()["id"]
-            # key 含 schema(source_file 体现归属);同键取最大频次
-            merged: dict[tuple, int] = {}
-            for r in slow_extra_qmap:
-                schema_k = r["source_file"].split(":", 1)[1]
-                key = (schema_k, r["query_fingerprint"], r["table_name"],
-                       r["column_name"], r["usage"])
-                merged[key] = max(merged.get(key, 0), r["freq"])
-            conn.execute(
-                "DELETE FROM query_column_map WHERE repo_id=? AND source_file LIKE 'slow_query:%'",
-                (sid,),
-            )
-            rows = [
-                (sid, fp, f"slow_query:{schema_k}", 0, tbl, col, usage, freq)
-                for (schema_k, fp, tbl, col, usage), freq in merged.items()
-            ]
-            conn.executemany(
-                "INSERT INTO query_column_map(repo_id, query_fingerprint, source_file, "
-                "source_line, table_name, column_name, usage, freq) VALUES(?,?,?,?,?,?,?,?)",
-                rows,
-            )
-            conn.commit()
-            console.print(f"慢查询证据:{sum(len(v) for v in slow_by_schema.values())} 条,"
-                          f"访问路径 {len(merged)} 条并入")
-        qmap += slow_extra_qmap
 
         # 4) 规则引擎 + 报告
         results = [run_audit(conn, schema, qmap, anti_patterns,
@@ -811,12 +795,15 @@ def audit(
         from codeatlas.providers.embedding import EmbeddingProvider as _EP
         from codeatlas.schema.audit import index_report as _index_report
 
-        _lance = _LS(get_settings())
-        _embed = _EP(get_settings(), conn)
+        _s = get_settings()
+        _lance = _LS(_s)
+        _embed = (_EP(_s, conn)
+                  if _s.embed_base_url and _s.embed_api_key and _s.embed_model else None)
 
         async def _index_and_close():
-            n = await _index_report(conn, _lance, _embed, report, get_settings())
-            await _embed.aclose()
+            n = await _index_report(conn, _lance, _embed, report, _s)
+            if _embed is not None:
+                await _embed.aclose()
             return n
 
         n_rc = asyncio.run(_index_and_close())
@@ -834,8 +821,8 @@ def audit(
         conn.close()
 
 
-async def _wiki_one(cfg, concise: bool, max_pages: int | None) -> bool:
-    """生成单个仓库的 wiki;返回是否成功。"""
+async def _wiki_one(cfg, concise: bool, max_pages: int | None, tracker) -> str:
+    """生成单个仓库的 wiki;返回 ok / skipped(未索引)/ failed / cost(费用超限)。"""
     from codeatlas.db.lance import LanceStore
     from codeatlas.gencode.wiki import generate_wiki
 
@@ -851,11 +838,12 @@ async def _wiki_one(cfg, concise: bool, max_pages: int | None) -> bool:
     ).fetchone()["c"]:
         console.print(f"[yellow]{cfg.name} 尚未索引,跳过(先 atlas index --repo {cfg.name})[/yellow]")
         conn.close()
-        return False
+        return "skipped"
 
+    embed_ready = bool(s.embed_base_url and s.embed_api_key and s.embed_model)
     lance = LanceStore(s)
-    llm = LLMProvider(s, conn)
-    embedder = EmbeddingProvider(s, conn)
+    llm = LLMProvider(s, conn, tracker=tracker)
+    embedder = EmbeddingProvider(s, conn) if embed_ready else None
     try:
         with console.status(f"[bold]wiki 生成中:{cfg.name}…[/bold]"):
             stats = await generate_wiki(
@@ -871,18 +859,22 @@ async def _wiki_one(cfg, concise: bool, max_pages: int | None) -> bool:
         )
         for e in stats.errors:
             console.print(f"[yellow]{e}[/yellow]")
-        return True
+        return "ok"
+    except CostLimitExceeded as e:
+        console.print(f"[red]{cfg.name} 费用超限,已停止(已生成的页已保存):{e}[/red]")
+        return "cost"
     except Exception as e:
         console.print(f"[red]{cfg.name} wiki 生成失败:{e}[/red]")
-        return False
+        return "failed"
     finally:
         await llm.aclose()
-        await embedder.aclose()
+        if embedder is not None:
+            await embedder.aclose()
         conn.close()
 
 
-async def _wiki(repo_name: str | None, concise: bool, max_pages: int | None, force: bool) -> None:
-    from codeatlas.config import load_repos
+async def _wiki(repo_name: str | None, concise: bool, max_pages: int | None) -> None:
+    from codeatlas.providers._retry import CostTracker
 
     all_repos = load_repos()
     if repo_name:
@@ -893,11 +885,19 @@ async def _wiki(repo_name: str | None, concise: bool, max_pages: int | None, for
     else:
         repos = all_repos
         console.print(f"未指定 --repo,遍历 repos.yaml({len(repos)} 个)逐个生成")
-    ok = 0
+    # 费用上限按整条命令计:各仓库共用一个累计器
+    tracker = CostTracker(get_settings().cost_limit_per_run)
+    results: dict[str, str] = {}
     for cfg in repos:
-        if await _wiki_one(cfg, concise, max_pages):
-            ok += 1
+        results[cfg.name] = await _wiki_one(cfg, concise, max_pages, tracker)
+        if results[cfg.name] == "cost":
+            break
+    ok = sum(1 for v in results.values() if v == "ok")
+    bad = [k for k, v in results.items() if v in ("failed", "cost")]
     console.print(f"\n完成:{ok}/{len(repos)} 个仓库。冷启动评审:阅读各页 front-matter 的 metrics。")
+    if bad:
+        console.print(f"[red]失败:{', '.join(bad)}[/red]")
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -905,10 +905,9 @@ def wiki(
     repo: str = typer.Argument(None, help="仓库名(缺省 = repos.yaml 全部,已索引的逐个生成)"),
     concise: bool = typer.Option(False, "--concise", help="4~6 页精简模式(冷启动推荐)"),
     max_pages: int = typer.Option(None, "--max-pages", help="限制生成页数(冷启动试跑)"),
-    force: bool = typer.Option(False, "--force", help="强制重生成(人工保护仍然生效)"),
 ) -> None:
     """生成仓库 wiki(结构规划 → 逐页 grounding → 五层校验 → 入索引)。"""
-    asyncio.run(_wiki(repo, concise, max_pages, force))
+    asyncio.run(_wiki(repo, concise, max_pages))
 
 
 @app.command("index-docs")
@@ -921,12 +920,14 @@ def index_docs_cmd() -> None:
     s = get_settings()
     conn = connect()
     init_db(conn)
-    embedder = EmbeddingProvider(s, conn)
+    embed_ready = bool(s.embed_base_url and s.embed_api_key and s.embed_model)
+    embedder = EmbeddingProvider(s, conn) if embed_ready else None
     lance = LanceStore(s)
 
     async def _run():
         n = await index_docs(conn, lance, embedder, DOCS_DIR, s)
-        await embedder.aclose()
+        if embedder is not None:
+            await embedder.aclose()
         return n
 
     try:
@@ -950,8 +951,12 @@ async def _ask(question: str, repo_name: str | None, max_turns: int) -> None:
             )
         console.print(Panel(result.answer, title="回答"))
         _print_agent_result(result)
+    except ProviderError as e:  # 含 CostLimitExceeded
+        console.print(f"[red]问答失败:{e}[/red]")
+        raise typer.Exit(code=1) from None
     finally:
-        await embedder.aclose()
+        if embedder is not None:
+            await embedder.aclose()
         await llm.aclose()
         conn.close()
 
@@ -988,12 +993,19 @@ async def _agent_session(
             totals["questions"] += 1
             try:
                 with console.status("[bold]agent 思考中…[/bold]"):
-                    result = await run_agent(
+                    result = await _run_interruptible(run_agent(
                         question, llm, conn, toolbox, repo_name=repo_name,
                         max_turns=max_turns or DEFAULT_MAX_TURNS,
                         history=history,
-                    )
-            except KeyboardInterrupt:
+                    ))
+            except CostLimitExceeded as e:
+                console.print(f"[red]{e}[/red]")
+                break
+            except ProviderError as e:
+                console.print(f"[red]本问失败:{e}[/red]\n[dim]记忆保留,可继续提问。[/dim]")
+                question = None
+                continue
+            if result is None:
                 console.print("[yellow]已中断本问(记忆保留,可继续提问)。[/yellow]")
                 question = None
                 continue
@@ -1005,7 +1017,8 @@ async def _agent_session(
             history = _trim_history(result.messages, memory_turns)
             question = None
     finally:
-        await embedder.aclose()
+        if embedder is not None:
+            await embedder.aclose()
         await llm.aclose()
         conn.close()
         console.print(

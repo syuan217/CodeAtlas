@@ -3,15 +3,13 @@
 import pytest
 
 from codeatlas.config import RepoCfg
-from codeatlas.graph.call_resolver.base import build_context
-from codeatlas.graph.call_resolver.orchestrate import resolve_and_write_calls
 from codeatlas.graph.queries import (
     callees_of,
     callers_of,
     find_symbols,
     impact_of,
 )
-from conftest import Env, FakeEmbedServer, copy_fixture
+from conftest import Env, FakeEmbedServer
 
 JAVA_MULTI = b"""package com.demo.svc;
 
@@ -251,8 +249,8 @@ def test_heuristic_dependent_via_calls_edge(tmp_path, monkeypatch):
     e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
     root = tmp_path / "hd"
     root.mkdir()
-    (root / "a.py").write_text("def run():\n    go()\n")
-    (root / "b.py").write_text("def go():\n    pass\n")
+    (root / "a.py").write_text("def run():\n    go()\n", encoding="utf-8")
+    (root / "b.py").write_text("def go():\n    pass\n", encoding="utf-8")
     e.run(RepoCfg(name="hd", path=root))
     before = e.q(
         "SELECT b.qualified_name AS d FROM edges e JOIN symbols b ON e.dst_id=b.id "
@@ -260,8 +258,8 @@ def test_heuristic_dependent_via_calls_edge(tmp_path, monkeypatch):
     )
     assert [r["d"] for r in before] == ["b.go"]  # 库内唯一 → heuristic 绑 b.go
 
-    (root / "b.py").write_text("def other():\n    pass\n")
-    (root / "c.py").write_text("def go():\n    pass\n")
+    (root / "b.py").write_text("def other():\n    pass\n", encoding="utf-8")
+    (root / "c.py").write_text("def go():\n    pass\n", encoding="utf-8")
     import time
     time.sleep(0.01)
     e.run(RepoCfg(name="hd", path=root))
@@ -313,7 +311,6 @@ def test_pattern_a_instance_getter_not_bound_to_static(tmp_path, monkeypatch):
 
 def test_pattern_a_self_loop_suppressed(tmp_path, monkeypatch):
     """自环红旗:方法内调用自己名(唯一候选=自身)→ 兜底排除 caller 自身。"""
-    from codeatlas.graph.call_resolver.base import ResolveContext, build_context
 
     e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
     root = tmp_path / "sl"
@@ -401,3 +398,83 @@ def test_pattern_d_third_party_receiver_dropped(tmp_path, monkeypatch):
     assert not any(d.endswith("#add") for d, _ in dsts)
     # add(1) 命名导入 → exact
     assert ("src/services/task.add", "exact") in dsts
+
+
+def test_same_path_in_two_repos_edges_isolated(tmp_path, monkeypatch):
+    """两仓库同路径文件:重索引 ra(依赖闭包重解析 app/main.py)不得删改 rb 的调用边,
+    写入的边也不得引用 rb 的符号。"""
+    import time
+
+    e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
+    roots = {}
+    for name in ("ra", "rb"):
+        root = tmp_path / name / "app"
+        root.mkdir(parents=True)
+        (root / "__init__.py").write_text("", encoding="utf-8")
+        (root / "util.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+        (root / "main.py").write_text(
+            "from app.util import helper\n\n\ndef main():\n    return helper()\n"
+        , encoding="utf-8")
+        roots[name] = tmp_path / name
+        e.run(RepoCfg(name=name, path=roots[name]))
+
+    def calls(repo: str) -> list:
+        return e.q(
+            "SELECT e.src_id, a.repo_id AS src_repo, b.repo_id AS dst_repo FROM edges e "
+            "JOIN symbols a ON a.id=e.src_id JOIN symbols b ON b.id=e.dst_id "
+            "JOIN repos r ON r.id=e.repo_id WHERE e.kind='CALLS' AND r.name=?", repo,
+        )
+
+    rb_before = [tuple(r) for r in calls("rb")]
+    assert len(rb_before) == 1
+
+    time.sleep(0.01)
+    (roots["ra"] / "app" / "util.py").write_text("def helper():\n    return 2\n", encoding="utf-8")
+    e.run(RepoCfg(name="ra", path=roots["ra"]))
+
+    assert [tuple(r) for r in calls("rb")] == rb_before   # rb 不受影响
+    ra_id = e.one("SELECT id FROM repos WHERE name='ra'")["id"]
+    ra_calls = calls("ra")
+    assert len(ra_calls) == 1
+    assert ra_calls[0]["src_repo"] == ra_id and ra_calls[0]["dst_repo"] == ra_id
+    e.close()
+
+
+def test_find_symbols_suffix_match_preferred(java_env):
+    """'Class#method' 短写:按限定名后缀精确命中,不把所有同名方法拉进来。"""
+    syms = find_symbols(java_env.conn, "Order#name")
+    assert [s["qualified_name"] for s in syms] == ["com.demo.model.Order#name"]
+    assert syms[0]["repo"] == "j"
+    both = find_symbols(java_env.conn, "name")
+    assert {s["qualified_name"] for s in both} == {
+        "com.demo.model.Order#name", "com.demo.other.Conflicter#name",
+    }
+
+
+def test_call_edges_stats_without_repo(java_env):
+    from codeatlas.graph.queries import call_edges_stats
+
+    stats = call_edges_stats(java_env.conn, None)  # 曾拼出 "FROM edges e AND ..." 语法错
+    assert stats.get("exact", 0) >= 1
+
+
+def test_cli_symbol_ambiguity_is_reported_not_guessed(java_env, capsys):
+    """同名多匹配必须报歧义退出,不得静默取第一个(结构查询号称确定性)。"""
+    import json
+
+    import typer
+
+    import codeatlas.cli as cli_mod
+
+    with pytest.raises(typer.Exit):
+        cli_mod._resolve_symbol_or_exit(java_env.conn, "name", None)
+    sym, _ = cli_mod._resolve_symbol_or_exit(java_env.conn, "Order#name", None)
+    assert sym["qualified_name"] == "com.demo.model.Order#name"
+    capsys.readouterr()
+    with pytest.raises(typer.Exit):
+        cli_mod._resolve_symbol_or_exit(java_env.conn, "name", None, as_json=True)
+    err = json.loads(capsys.readouterr().out)
+    assert err["error"] == "ambiguous"
+    assert {c["qualified_name"] for c in err["candidates"]} == {
+        "com.demo.model.Order#name", "com.demo.other.Conflicter#name",
+    }

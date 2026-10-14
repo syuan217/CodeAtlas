@@ -2,12 +2,13 @@
 
 import asyncio
 import json
+import re
 
 import httpx
+import pytest
 
 from codeatlas.config import RepoCfg
 from codeatlas.gencode.freshness import (
-    is_stale,
     mark_stale_pages,
     read_front_matter,
     write_page,
@@ -113,23 +114,69 @@ def test_check_mermaid():
 
 
 def test_freshness_human_protection(tmp_path):
-    page = tmp_path / "mod.md"
+    page = tmp_path / "01-ch" / "mod.md"
     target = write_page(
-        page, {"repo": "r", "module_id": "mod", "source_hash": "h1"},
+        page, {"repo": "r", "source_files": "a.java", "source_hash": "h1"},
         f"# 正文{NL}内容",
     )
     assert target == page
-    page.write_text(page.read_text().replace("# 正文", "# 人工改过的正文"))
+    page.write_text(page.read_text(encoding="utf-8").replace("# 正文", "# 人工改过的正文"), encoding="utf-8")
     target2 = write_page(
-        page, {"repo": "r", "module_id": "mod", "source_hash": "h2"}, "# 新版正文"
+        page, {"repo": "r", "source_files": "a.java", "source_hash": "h2"}, "# 新版正文"
     )
-    assert target2 == tmp_path / "mod.suggested.md"
-    assert "人工改过的正文" in page.read_text()
+    assert target2 == page.with_suffix(".suggested.md")
+    assert "人工改过的正文" in page.read_text(encoding="utf-8")
     fm = read_front_matter(page)
     assert fm["source_hash"] == "h1"
-    stale = mark_stale_pages(tmp_path, {"mod": "h2"})
+    # 页面在章节子目录里:过期扫描必须递归
+    stale = mark_stale_pages(tmp_path, lambda files: "h2" if files == ["a.java"] else "")
     assert "mod" in stale
-    assert "已过期" in page.read_text()
+    assert "已过期" in page.read_text(encoding="utf-8")
+
+
+def test_freshness_unedited_page_is_overwritten(tmp_path):
+    """未被人改过的页:重生成直接覆盖原页,不写 .suggested.md(曾因换行口径不一致恒判人工修改)。"""
+    page = tmp_path / "01-ch" / "p.md"
+    write_page(page, {"repo": "r"}, f"# v1{NL}正文")
+    target = write_page(page, {"repo": "r"}, f"# v2{NL}正文")
+    assert target == page
+    assert "# v2" in page.read_text(encoding="utf-8")
+    assert not page.with_suffix(".suggested.md").exists()
+
+
+def test_freshness_stale_banner_is_not_a_human_edit(tmp_path):
+    page = tmp_path / "p.md"
+    write_page(page, {"repo": "r", "source_files": "a.java", "source_hash": "h1"}, "# v1")
+    assert mark_stale_pages(tmp_path, lambda files: "h2") == ["p"]
+    assert "已过期" in page.read_text(encoding="utf-8")
+    assert mark_stale_pages(tmp_path, lambda files: "h2") == ["p"]  # 幂等
+    assert page.read_text(encoding="utf-8").count("已过期") == 1
+    target = write_page(page, {"repo": "r", "source_files": "a.java", "source_hash": "h2"}, "# v2")
+    assert target == page                     # 工具自己插的 banner 不算人工修改
+    assert "已过期" not in page.read_text(encoding="utf-8")
+    assert "# v2" in page.read_text(encoding="utf-8")
+
+
+def test_freshness_reviewed_or_foreign_page_protected(tmp_path):
+    reviewed = tmp_path / "r.md"
+    write_page(reviewed, {"repo": "r", "reviewed": "false"}, "# v1")
+    reviewed.write_text(reviewed.read_text(encoding="utf-8").replace("reviewed: false", "reviewed: true"), encoding="utf-8")
+    assert write_page(reviewed, {"repo": "r", "reviewed": "false"}, "# v2") == \
+        reviewed.with_suffix(".suggested.md")
+    assert "# v1" in reviewed.read_text(encoding="utf-8")
+
+    foreign = tmp_path / "f.md"                # 无 front-matter:人写的同名文件
+    foreign.write_text("# 我自己的笔记", encoding="utf-8")
+    assert write_page(foreign, {"repo": "r"}, "# 生成") == foreign.with_suffix(".suggested.md")
+    assert foreign.read_text(encoding="utf-8") == "# 我自己的笔记"
+
+
+def test_freshness_leftover_suggestion_removed_on_overwrite(tmp_path):
+    page = tmp_path / "p.md"
+    write_page(page, {"repo": "r"}, "# v1")
+    page.with_suffix(".suggested.md").write_text("旧建议稿", encoding="utf-8")
+    write_page(page, {"repo": "r"}, "# v2")
+    assert not page.with_suffix(".suggested.md").exists()
 
 
 def _wiki_llm_handler(request: httpx.Request) -> httpx.Response:
@@ -200,6 +247,90 @@ def test_generate_wiki_end_to_end(tmp_path, monkeypatch):
     assert n == stats.indexed_chunks > 0
     n_fts = e.one(
         "SELECT COUNT(*) AS c FROM chunks_fts f JOIN chunks c ON c.id=f.rowid "
-        "WHERE chunks_fts MATCH 'truncate'"
+        "WHERE chunks_fts MATCH 'truncate' AND c.kind='wiki'"
     )["c"]
-    assert n_fts >= 1
+    assert n_fts >= 1  # wiki chunk 本身可被关键词检索(此前只写 chunks 未写 FTS)
+
+
+def _wiki_env(tmp_path, monkeypatch):
+    from codeatlas import config as config_mod
+
+    monkeypatch.setattr(config_mod, "WIKI_DIR", tmp_path / "wiki")
+    e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
+    repo = RepoCfg(name="jmini", path=copy_fixture("java_mini", tmp_path))
+    e.run(repo)
+    return e, repo, tmp_path / "wiki" / "jmini"
+
+
+def _run_wiki(e, repo, handler, tracker=None, **kw):
+    from codeatlas.gencode.wiki import generate_wiki
+    from codeatlas.providers.llm import LLMProvider
+
+    llm = LLMProvider(e.settings, e.conn, transport=httpx.MockTransport(handler),
+                      backoff_base=0, tracker=tracker)
+    return asyncio.run(generate_wiki(repo, e.conn, llm, e.settings, e.lance(), e.provider(),
+                                     concise=True, budget_tokens=50_000, **kw))
+
+
+def test_wiki_one_failed_page_does_not_discard_others(tmp_path, monkeypatch):
+    e, repo, wiki_dir = _wiki_env(tmp_path, monkeypatch)
+
+    def handler(request):
+        user = json.loads(request.content)["messages"][-1]["content"]
+        if re.search(r"页面 id[:\uff1a]com[(\uff08]", user):
+            return httpx.Response(400, json={"error": "bad request"})
+        return _wiki_llm_handler(request)
+
+    stats = _run_wiki(e, repo, handler)
+    assert stats.pages_failed >= 1 and any("com" in err for err in stats.errors)
+    pages = [p for p in wiki_dir.rglob("*.md") if p.name != "README.md"]
+    assert pages and all(p.stem != "com" for p in pages)
+    toc = (wiki_dir / "README.md").read_text(encoding="utf-8")
+    assert "com.md" not in toc  # 目录不链接未生成的页
+
+
+def test_wiki_cost_limit_keeps_finished_pages(tmp_path, monkeypatch):
+    from codeatlas.providers._retry import CostLimitExceeded, CostTracker
+
+    e, repo, wiki_dir = _wiki_env(tmp_path, monkeypatch)
+    e.settings = e.settings.model_copy(update={"llm_price_prompt": 1e4,
+                                               "llm_price_completion": 1e4})
+    tracker = CostTracker(limit=3.5)  # 每次调用 1.5 元:规划 + 1 页后的下一次即超
+    with pytest.raises(CostLimitExceeded):
+        _run_wiki(e, repo, _wiki_llm_handler, tracker=tracker)
+    pages = [p for p in wiki_dir.rglob("*.md") if p.name != "README.md"]
+    assert len(pages) >= 1  # 已付费生成的页落盘,不随异常丢失
+
+
+def test_wiki_orphan_pages_cleaned_human_ones_kept(tmp_path, monkeypatch):
+    e, repo, wiki_dir = _wiki_env(tmp_path, monkeypatch)
+    old = wiki_dir / "09-old" / "old.md"
+    write_page(old, {"repo": "jmini"}, "# 旧规划遗留页")
+    mine = wiki_dir / "09-old" / "mine.md"
+    write_page(mine, {"repo": "jmini"}, "# 生成页")
+    mine.write_text(mine.read_text(encoding="utf-8").replace("# 生成页", "# 人工改写过"), encoding="utf-8")
+    _run_wiki(e, repo, _wiki_llm_handler)
+    assert not old.exists()
+    assert mine.exists()
+    titles = {r["title"] for r in e.q("SELECT title FROM chunks WHERE kind='wiki'")}
+    assert not any(":old:" in t for t in titles)
+
+
+def test_wiki_cli_exit_code_reflects_failures(monkeypatch):
+    import typer
+
+    import codeatlas.cli as cli_mod
+    from codeatlas.config import RepoCfg as _R
+
+    monkeypatch.setattr(cli_mod, "load_repos",
+                        lambda: [_R(name="a", path="/tmp"), _R(name="b", path="/tmp")])
+    monkeypatch.setattr("codeatlas.config.load_repos",
+                        lambda: [_R(name="a", path="/tmp"), _R(name="b", path="/tmp")])
+
+    async def fake_one(cfg, concise, max_pages, tracker):
+        return "ok" if cfg.name == "a" else "failed"
+
+    monkeypatch.setattr(cli_mod, "_wiki_one", fake_one)
+    with pytest.raises(typer.Exit) as ei:
+        asyncio.run(cli_mod._wiki(None, False, None))
+    assert ei.value.exit_code == 1

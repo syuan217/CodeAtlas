@@ -15,7 +15,6 @@ from codeatlas.graph.call_resolver.base import (
     ResolveContext,
     SymInfo,
     pick_unique,
-    unique_name_fallback,
 )
 from codeatlas.graph.schema import split_method_qname
 

@@ -30,7 +30,6 @@ class LanceStore:
     @property
     def table(self):
         if self._table is None:
-            import lancedb
 
             try:
                 self._table = self.db.open_table("chunks")
@@ -105,27 +104,31 @@ class LanceStore:
         except Exception:
             return False
 
-    def reconcile_orphans(self, valid_chunk_ids: set[int], expected_rows: int | None = None) -> int:
-        """删除 Lance 中不属于任何现存 chunk 的孤儿向量(中断残留)。
+    def reconcile_orphans(
+        self, valid_chunk_ids: set[int], expected_rows: int | None = None
+    ) -> tuple[int, set[int]]:
+        """双向对账,返回 (删除的孤儿向量数, 缺失向量的 chunk_id 集合)。
 
+        孤儿 = Lance 有、vector_refs 无(中断残留)→ 删除;
+        缺失 = vector_refs 有、Lance 无(删了向量但 SQL 未提交就中断)→ 交调用方
+        删 vector_refs,下轮完整性自愈重嵌(embed_cache 命中不计费)。
         expected_rows(vector_refs 行数)一致时直接跳过,避免每轮全表扫描;
         不一致才 to_arrow 拉全表对账。TODO 百万 chunk 级需换成分片对账。
         """
         try:
             if expected_rows is not None and self.count() == expected_rows:
-                return 0
+                return 0, set()
             arrow = self.table.to_arrow()  # pylance 不可用,to_arrow 全表(大库慎用)
             all_ids = set(arrow.column("chunk_id").to_pylist())
         except Exception:
-            return 0
+            return 0, set()
+        missing = valid_chunk_ids - all_ids
         orphans = sorted(i for i in all_ids if i not in valid_chunk_ids)
-        if not orphans:
-            return 0
         BATCH = 5000
         for i in range(0, len(orphans), BATCH):
             ids = ",".join(str(int(x)) for x in orphans[i : i + BATCH])
             self.table.delete(f"chunk_id IN ({ids})")
-        return len(orphans)
+        return len(orphans), missing
 
     def rebuild_from_sql(self, conn) -> tuple[int, int]:
         """一次性修复:按 vector_refs + embed_cache 重写整张向量表。

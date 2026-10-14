@@ -56,27 +56,30 @@ def _resolver_for(lang: str):
     return generic_resolver
 
 
-def _qname_to_id(conn: sqlite3.Connection, rel: str) -> dict[str, int] | None:
+def _qname_to_id(conn: sqlite3.Connection, repo_id: int, rel: str) -> dict[str, int] | None:
+    # 必须带 repo_id:多仓库常有同路径文件(src/index.tsx 等),只按 path 会串到别的仓库
     rows = conn.execute(
         "SELECT s.id, s.qualified_name FROM symbols s "
-        "JOIN files f ON s.file_id = f.id WHERE f.path = ?",
-        (rel,),
+        "JOIN files f ON s.file_id = f.id WHERE f.repo_id = ? AND f.path = ?",
+        (repo_id, rel),
     ).fetchall()
     if not rows:
         return None
     return {r["qualified_name"]: r["id"] for r in rows}
 
 
-def _module_id(conn: sqlite3.Connection, rel: str) -> int | None:
+def _module_id(conn: sqlite3.Connection, repo_id: int, rel: str) -> int | None:
     row = conn.execute(
         "SELECT s.id FROM symbols s JOIN files f ON s.file_id=f.id "
-        "WHERE f.path=? AND s.kind='module'",
-        (rel,),
+        "WHERE f.repo_id=? AND f.path=? AND s.kind='module'",
+        (repo_id, rel),
     ).fetchone()
     return row["id"] if row else None
 
 
-def light_call_file(conn: sqlite3.Connection, repo: RepoCfg, rel: str) -> CallFile | None:
+def light_call_file(
+    conn: sqlite3.Connection, repo_id: int, repo: RepoCfg, rel: str
+) -> CallFile | None:
     """依赖闭包文件重解析:重读文件重建 fs 与调用点,库 symbol id 按 qname 对齐。"""
     try:
         raw = (repo.path / rel).read_bytes()
@@ -86,8 +89,8 @@ def light_call_file(conn: sqlite3.Connection, repo: RepoCfg, rel: str) -> CallFi
     if lang is None:
         return None
     fs = extract_symbols(rel, lang, raw)
-    qmap = _qname_to_id(conn, rel)
-    module_id = _module_id(conn, rel)
+    qmap = _qname_to_id(conn, repo_id, rel)
+    module_id = _module_id(conn, repo_id, rel)
     if qmap is None or module_id is None:
         return None
     sym_ids = {
@@ -114,8 +117,9 @@ def resolve_and_write_calls(
         # 替换语义:清该文件符号的全部旧 CALLS 出边后重写
         conn.execute(
             "DELETE FROM edges WHERE kind='CALLS' AND src_id IN "
-            "(SELECT s.id FROM symbols s JOIN files f ON s.file_id=f.id WHERE f.path=?)",
-            (cf.fs.rel,),
+            "(SELECT s.id FROM symbols s JOIN files f ON s.file_id=f.id "
+            " WHERE f.repo_id=? AND f.path=?)",
+            (repo_id, cf.fs.rel),
         )
         for site in cf.sites:
             stats.sites += 1

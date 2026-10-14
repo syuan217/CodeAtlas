@@ -108,12 +108,23 @@ def _slice_lines(lines: list[str], start_1based: int, end_1based: int) -> str:
 # code 切块
 # ---------------------------------------------------------------------------
 
+def _lead(s) -> int:
+    """符号块起始行:并入紧邻的注释块与注解/装饰器。"""
+    return min(x for x in (s.javadoc_start, s.lead_start, s.line_start) if x)
+
+
+# 符号之外的行里,这些不值得单独成块(纯括号、包/导入声明)
+_TRIVIAL_LINE = re.compile(r"^\s*([{}()\[\];,]*|package\s.*|import\s.*|from\s+\S+\s+import\s.*)$")
+_GAP_MIN_CHARS = 20
+
+
 def chunk_code(
     text: str,
     fs: FileSymbols,
     max_tokens: int,
 ) -> list[ChunkOut]:
-    """按符号切块;符号文本本身超限则对该符号做词级回退。"""
+    """按符号切块(并入注释/注解);符号之外的有效代码(字段、模块级常量/路由表、
+    main 段等)按连续行段另行成块;超限的块做词级回退。"""
     lines = text.splitlines()
     out: list[ChunkOut] = []
 
@@ -122,15 +133,16 @@ def chunk_code(
     for i, s in enumerate(fs.symbols):
         if s.parent is not None:
             cur = first_child_line.get(s.parent)
-            if cur is None or s.line_start < cur:
-                first_child_line[s.parent] = s.line_start
+            if cur is None or _lead(s) < cur:
+                first_child_line[s.parent] = _lead(s)
 
     for idx, s in enumerate(fs.symbols):
         if s.kind in ("function", "method"):
-            body = _slice_lines(lines, s.line_start, s.line_end)
-            out.extend(_emit(body, s, s.line_start, max_tokens, kind="code"))
+            start = _lead(s)
+            body = _slice_lines(lines, start, s.line_end)
+            out.extend(_emit(body, s, start, max_tokens, kind="code"))
         elif s.kind in ("class", "interface"):
-            start = s.javadoc_start or s.line_start
+            start = _lead(s)
             end = (first_child_line.get(idx, s.line_end + 1)) - 1
             if end < start:
                 end = s.line_end  # 无子符号:整个类范围(纯声明类)
@@ -138,7 +150,37 @@ def chunk_code(
             out.extend(_emit(head, s, start, max_tokens, kind="code"))
 
     if not out and text.strip():  # 无符号文件(xml/sql/空壳)整体词级回退
-        out = word_fallback(text, max_tokens, kind="code", title=fs.rel)
+        return word_fallback(text, max_tokens, kind="code", title=fs.rel)
+    out.extend(_gap_chunks(lines, out, fs.rel, max_tokens))
+    return out
+
+
+def _gap_chunks(lines: list[str], chunks: list[ChunkOut], title: str,
+                max_tokens: int) -> list[ChunkOut]:
+    """未被任何符号块覆盖的连续行段 → 补充块(过滤纯括号/导入,太短的不要)。"""
+    covered = [False] * (len(lines) + 2)
+    for c in chunks:
+        for ln in range(c.line_start, min(c.line_end, len(lines)) + 1):
+            covered[ln] = True
+    out: list[ChunkOut] = []
+    ln = 1
+    while ln <= len(lines):
+        if covered[ln]:
+            ln += 1
+            continue
+        start = ln
+        while ln <= len(lines) and not covered[ln]:
+            ln += 1
+        useful = [i for i in range(start, ln) if not _TRIVIAL_LINE.match(lines[i - 1])]
+        if not useful or sum(len(lines[i - 1].strip()) for i in useful) < _GAP_MIN_CHARS:
+            continue
+        a, b = useful[0], useful[-1]
+        body = _slice_lines(lines, a, b)
+        if estimate_tokens(body) <= max_tokens:
+            out.append(ChunkOut(kind="code", title=title, content=body,
+                                line_start=a, line_end=b))
+        else:
+            out.extend(word_fallback(body, max_tokens, kind="code", title=title, base_line=a))
     return out
 
 
@@ -164,7 +206,6 @@ def chunk_markdown(text: str, max_tokens: int) -> list[ChunkOut]:
         return []
     bounds: list[tuple[int, str | None]] = []  # (起始行 1-based, 标题)
     fence = False
-    title: str | None = None
     for i, line in enumerate(lines):
         stripped = line.lstrip()
         if stripped.startswith("```") or stripped.startswith("~~~"):

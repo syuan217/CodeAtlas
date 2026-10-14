@@ -2,7 +2,6 @@
 
 import sqlite3
 
-import pytest
 
 from codeatlas.ingest.imports_resolver import ImportRef, write_import_edges
 from codeatlas.ingest.symbols import extract_symbols

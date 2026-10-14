@@ -30,7 +30,8 @@ description: Use when the user wants to locate, verify, or check code in a codeb
 1. 结构查询命令(search/callers/callees/definition/impact)一律加 `--json` 输出;`ask` 无此选项;
 2. callers/callees/impact/definition 是确定性图查询,不经过 LLM;引用
    `resolution: heuristic` 的边时注明置信度,`exact` 可直接陈述;
-3. 符号多匹配报错时,用报错列出的完整限定名(如 `com.x.S#create`)重试;
+3. 符号多匹配时命令以非零退出并返回 `{"error": "ambiguous", "candidates": [...]}`,
+   用其中的完整限定名(如 `com.x.S#create`,或 `Class#method` 短写)或 `--repo` 重试;
    拿不准短名先 `definition` 消歧;
 4. 回答中的代码引用用 `[相对路径:起始行-结束行]`,字段直接取自 JSON 的
    `path`/`line_start`/`line_end`;

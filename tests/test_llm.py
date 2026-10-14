@@ -153,3 +153,30 @@ async def test_malformed_response_raises(settings, db):
                            backoff_base=0) as p:
         with pytest.raises(ProviderError, match=r"缺 choices"):
             await p.chat([{"role": "user", "content": "x"}])
+
+
+async def test_thinking_param_switchable(settings, db):
+    """thinking:{type:disabled} 是 GLM 系参数;OpenAI 官方等不认未知参数会 400,可关。"""
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=ok_chat_body())
+
+    for flag in (True, False):
+        s = settings.model_copy(update={"llm_thinking_control": flag})
+        async with LLMProvider(s, db, transport=httpx.MockTransport(handler),
+                               backoff_base=0) as p:
+            await p.chat([{"role": "user", "content": "x"}], thinking_disabled=True)
+    assert bodies[0]["thinking"] == {"type": "disabled"}
+    assert "thinking" not in bodies[1]
+
+
+async def test_non_json_200_raises_provider_error(settings, db):
+    def handler(request):
+        return httpx.Response(200, text="<html>gateway login</html>")
+
+    async with LLMProvider(settings, db, transport=httpx.MockTransport(handler),
+                           backoff_base=0) as p:
+        with pytest.raises(ProviderError):
+            await p.chat([{"role": "user", "content": "x"}])

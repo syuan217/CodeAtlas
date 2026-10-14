@@ -13,11 +13,12 @@ import sqlite3
 from dataclasses import dataclass, field
 
 from codeatlas.config import Settings
-from codeatlas.db.fts import fts_search
 from codeatlas.db.lance import LanceStore
 from codeatlas.providers.embedding import EmbeddingProvider
 
 RRF_K = 60
+SYMBOL_FANOUT_WORD = 10   # 问题里的普通词命中同名符号数上限
+SYMBOL_FANOUT_IDENT = 50  # 显式标识符(驼峰/下划线)命中同名符号数上限
 VECTOR_SOURCE = "vector"
 FTS_SOURCE = "fts"
 SYMBOL_SOURCE = "symbol"
@@ -67,7 +68,10 @@ def tokenize_query(q: str) -> list[str]:
             for i in range(len(s) - 1):
                 terms.append(s[i : i + 2])  # 中文 bigram(unicode61 对 CJK 分词无效)
         else:
-            for w in _CAMEL_RE.findall(tok):
+            parts = _CAMEL_RE.findall(tok)
+            if len(parts) > 1 and "_" not in tok:
+                terms.append(tok.lower())  # 整个标识符(createOrder → createorder)精确命中优先
+            for w in parts:
                 terms.append(w.lower())
     seen: set[str] = set()
     out = []
@@ -147,20 +151,29 @@ def _symbol_recall(conn: sqlite3.Connection, query: str, repo_id: int | None):
     候选词 = CamelCase/snake_case 标识符 + 问题中 ≥3 字符的普通词;
     用 symbols.name 精确匹配(IN 查询),库里无此符号名自然不命中,无误报。
     """
-    idents = extract_identifiers(query)
+    explicit = extract_identifiers(query)
+    idents = list(explicit)
     for t in tokenize_query(query):
         if len(t) >= 3 and t not in idents:
             idents.append(t)
     if not idents:
         return [], []
     ph = ",".join("?" * len(idents))
-    where = f" AND s.repo_id = ?" if repo_id is not None else ""
+    where = " AND s.repo_id = ?" if repo_id is not None else ""
     params: list = [*idents] + ([repo_id] if repo_id is not None else [])
-    rows = conn.execute(
-        f"SELECT s.id AS sid FROM symbols s WHERE s.name IN ({ph}){where}",
+    by_name: dict[str, list[int]] = {}
+    for r in conn.execute(
+        f"SELECT s.id AS sid, s.name FROM symbols s WHERE s.name IN ({ph}){where}",
         params,
-    ).fetchall()
-    sym_ids = [r["sid"] for r in rows]
+    ):
+        by_name.setdefault(r["name"], []).append(r["sid"])
+    # 同名符号过多 = 信号太泛(init/get/save…):普通词超 10 个、显式标识符超 50 个即不用,
+    # 否则图扩展会把成百上千个文件拉进候选,既淹没真正相关的结果也拖慢查询
+    sym_ids = [
+        sid for name, ids in by_name.items()
+        if len(ids) <= (SYMBOL_FANOUT_IDENT if name in explicit else SYMBOL_FANOUT_WORD)
+        for sid in ids
+    ]
     if not sym_ids:
         return [], []
     ph2 = ",".join("?" * len(sym_ids))
@@ -181,6 +194,7 @@ def _graph_expand(
         return []
     collected: list[int] = []
     ph = ",".join("?" * len(sym_ids))
+    sym_set = set(sym_ids)
 
     def chunks_of_symbols(sids: list[int]) -> list[int]:
         if not sids:
@@ -210,8 +224,8 @@ def _graph_expand(
             f"AND (e.src_id IN ({ph}) OR e.dst_id IN ({ph}))",
             [target_res, *sym_ids, *sym_ids],
         ).fetchall()
-        neighbors = list({r["d"] for r in rows} | {r["s"] for r in rows})
-        neighbors = [n for n in neighbors if n not in set(sym_ids)]
+        neighbors = [n for n in {r["d"] for r in rows} | {r["s"] for r in rows}
+                     if n not in sym_set]
         collected += chunks_of_symbols(neighbors)
 
     # 优先级 2:同文件符号(同模块)

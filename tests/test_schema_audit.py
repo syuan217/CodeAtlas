@@ -78,10 +78,10 @@ def test_parse_ddl_md_fences_and_ob_options(parsed):
 
 def test_load_ddl_text_formats(tmp_path):
     md = tmp_path / "x.md"
-    md.write_text("标题\n```sql\nSELECT 1;\n```\n其它 ```text\nnope\n```")
+    md.write_text("标题\n```sql\nSELECT 1;\n```\n其它 ```text\nnope\n```", encoding="utf-8")
     assert "SELECT 1" in load_ddl_text(md)
     sql = tmp_path / "y.sql"
-    sql.write_text("SELECT 2;")
+    sql.write_text("SELECT 2;", encoding="utf-8")
     assert load_ddl_text(sql) == "SELECT 2;"
 
 
@@ -211,13 +211,13 @@ def test_rules_end_to_end(audit_env):
 def test_profile_apply_activates_rules(audit_env, tmp_path):
     conn, qmap, anti = audit_env
     tpl = manual_template("testdb", parse_ddl("testdb", OB_DDL), out_dir=tmp_path)
-    data = json.loads(tpl.read_text())
+    data = json.loads(tpl.read_text(encoding="utf-8"))
     data["tables"]["t_order"]["row_count"] = 1200
     # 6 个索引(pk 不算,idx 有 3)→ 4 个以上?uk+2 idx=3,改加一个再填
     data["tables"]["t_order"]["index_cardinality"] = {}
     mp = tmp_path / "filled.json"
-    mp.write_text(json.dumps(data))
-    n = apply_profile(conn, "testdb", json.loads(mp.read_text()))
+    mp.write_text(json.dumps(data), encoding="utf-8")
+    n = apply_profile(conn, "testdb", json.loads(mp.read_text(encoding="utf-8")))
     assert n == 3
     row = conn.execute(
         "SELECT row_count FROM ddl_tables WHERE name='testdb.t_order'"
@@ -232,7 +232,7 @@ def test_profile_apply_activates_rules(audit_env, tmp_path):
 def test_generate_scripts_readonly(audit_env, tmp_path):
     p = parse_ddl("testdb", OB_DDL)
     scripts = generate_scripts({"testdb": p}, out_dir=tmp_path)
-    text = scripts[0].read_text()
+    text = scripts[0].read_text(encoding="utf-8")
     assert "information_schema" in text
     assert "SHOW INDEX" in text
     assert "GROUP BY" in text  # 低基数列抽样(t_order.status)
@@ -289,7 +289,6 @@ def test_fill_sheet_roundtrip(tmp_path, monkeypatch):
 
 def test_slow_query_import_and_qry101(tmp_path, monkeypatch):
     """慢查询文件通道:三种格式解析 + QRY101 规则 + 访问路径并入证据。"""
-    from pathlib import Path as P
 
     from codeatlas.schema.audit import run_audit
     from codeatlas.schema.collect_ob import import_slow_queries, parse_slow_file
@@ -302,26 +301,26 @@ def test_slow_query_import_and_qry101(tmp_path, monkeypatch):
         {"schema": "testdb", "sql": "SELECT * FROM t_order WHERE status = 'PAID'",
          "freq": 500, "avg_ms": 3200, "rows_scanned": 5000000, "rows_returned": 12},
         {"sql": "SELECT 1", "freq": 1},  # 无法归属(schema 空/表不命中)→ 丢弃
-    ]))
+    ]), encoding="utf-8")
     rows = parse_slow_file(jf)
     assert len(rows) == 2 and rows[0]["rows_scanned"] == 5000000
     counts = import_slow_queries(jf, parsed, out_dir=tmp_path)
     assert counts == {"testdb": 1}
-    data = json.loads((tmp_path / "testdb_manual.json").read_text())
+    data = json.loads((tmp_path / "testdb_manual.json").read_text(encoding="utf-8"))
     assert data["slow_queries"][0]["freq"] == 500
 
     # CSV 格式(中文表头)
     cf = tmp_path / "slow.csv"
     cf.write_text("库名,sql,频次,平均耗时ms,扫描行数,返回行数\n"
-                  "testdb,\"SELECT id FROM t_order WHERE org_code = 'X'\",80,900,900000,80\n")
+                  "testdb,\"SELECT id FROM t_order WHERE org_code = 'X'\",80,900,900000,80\n", encoding="utf-8")
     counts2 = import_slow_queries(cf, parsed, out_dir=tmp_path)
     assert counts2 == {"testdb": 1}
-    data2 = json.loads((tmp_path / "testdb_manual.json").read_text())
+    data2 = json.loads((tmp_path / "testdb_manual.json").read_text(encoding="utf-8"))
     assert len(data2["slow_queries"]) == 2  # 合并不覆盖
 
     # 纯文本 SQL(无统计)
     tf = tmp_path / "slow.txt"
-    tf.write_text("SELECT * FROM t_no_pk WHERE code = 'a'\n\nSELECT count(*) FROM t_order\n")
+    tf.write_text("SELECT * FROM t_no_pk WHERE code = 'a'\n\nSELECT count(*) FROM t_order\n", encoding="utf-8")
     counts3 = import_slow_queries(tf, parsed, out_dir=tmp_path)
     assert counts3 == {"testdb": 2}
 
@@ -331,7 +330,7 @@ def test_slow_query_import_and_qry101(tmp_path, monkeypatch):
     monkeypatch.setattr(_cfg, "DB_PATH", tmp_path / "q.sqlite")
     conn = _c(); _i(conn)
     persist_ddl(conn, parsed["testdb"])
-    slow = json.loads((tmp_path / "testdb_manual.json").read_text())["slow_queries"]
+    slow = json.loads((tmp_path / "testdb_manual.json").read_text(encoding="utf-8"))["slow_queries"]
     result = run_audit(conn, "testdb", [], [], slow_queries=slow)
     qry = [f for f in result.findings if f.rule_id == "QRY101"]
     assert len(qry) == 2  # JSON 条(5e6/12)与 CSV 条(9e5/80=11250)均超线
@@ -351,3 +350,51 @@ def test_fill_sheet_no_slow_section(tmp_path):
     text = sheet.read_text(encoding="utf-8")
     assert "import-slow" in text  # 指引走文件通道
     assert "| 库名 | SQL |" not in text  # 旧慢查询表格段已移除
+
+
+def test_report_and_docs_reindex_keeps_fts_consistent(tmp_path, monkeypatch):
+    """报告/人工文档重跑:新 chunk 写入 FTS(可被关键词检索),旧 chunk 的
+    FTS 行与向量一并清理,FTS 索引保持完整。"""
+    import asyncio
+
+    from codeatlas.config import RepoCfg
+    from codeatlas.db.fts import fts_search
+    from codeatlas.schema.audit import index_docs, index_report
+    from conftest import Env, FakeEmbedServer, copy_fixture
+
+    e = Env(tmp_path, monkeypatch, server=FakeEmbedServer())
+    e.run(RepoCfg(name="jmini", path=copy_fixture("java_mini", tmp_path)))
+    lance = e.lance()
+    rpt = tmp_path / "audit.md"
+    rpt.write_text("# 体检报告\n\n## t_settlement\n\n无主键 truncate\n", encoding="utf-8")
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "ops.md").write_text("# 上线手册\n\nrollback truncate 步骤\n", encoding="utf-8")
+    for _ in range(3):
+        asyncio.run(index_report(e.conn, lance, e.provider(), rpt, e.settings))
+        asyncio.run(index_docs(e.conn, lance, e.provider(), docs, e.settings))
+        e.conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")
+    kinds = {r["kind"] for r in fts_search(e.conn, "truncate", limit=50)}
+    assert {"code", "report", "doc"} <= kinds
+    assert [r["kind"] for r in fts_search(e.conn, "settlement")] == ["report"]
+    # 向量:每个现存 report/doc chunk 恰好一行,无旧 chunk 残留
+    n_live = e.one("SELECT COUNT(*) AS c FROM chunks WHERE kind IN ('report','doc')")["c"]
+    rows = lance.table.to_arrow().to_pylist()
+    live_ids = {r["id"] for r in e.q("SELECT id FROM chunks")}
+    assert all(r["chunk_id"] in live_ids for r in rows)
+    assert sum(1 for r in rows if r["kind"] in ("report", "doc")) == n_live
+    e.close()
+
+
+def test_like_on_function_wrapped_column_does_not_crash():
+    """WHERE LOWER(name) LIKE '%x%' 曾因 col=None 抛 AttributeError 中断整个 audit。"""
+    from codeatlas.schema.sql_extract import _extract_anti_patterns, _try_parse
+
+    for sql in ("SELECT id FROM t_order WHERE LOWER(name) LIKE '%x%'",
+                "SELECT id FROM t_order WHERE CONCAT(a, b) LIKE '%x'",
+                "SELECT id FROM t_order WHERE 'abc' LIKE '%x'"):
+        out = _extract_anti_patterns(_try_parse(sql), ["t_order"])
+        assert all(o["table"] == "t_order" for o in out)
+    out = _extract_anti_patterns(
+        _try_parse("SELECT id FROM t_order WHERE LOWER(name) LIKE '%x%'"), ["t_order"])
+    assert any(o["column"] == "name" for o in out)

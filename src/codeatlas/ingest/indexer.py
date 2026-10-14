@@ -14,13 +14,13 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from codeatlas.config import RepoCfg, Settings, get_settings, hash_bytes
 from codeatlas.db.fts import fts_delete_file, fts_insert
 from codeatlas.db.lance import LanceStore
-from codeatlas.db.models import connect, init_db
+from codeatlas.db.models import connect, in_chunks, init_db
 from codeatlas.ingest.chunker import chunk_text
 from codeatlas.ingest.gitdiff import compute_change_set
 from codeatlas.ingest.imports_resolver import ImportRef, write_import_edges
@@ -30,6 +30,7 @@ from codeatlas.graph.call_resolver.orchestrate import (
     resolve_and_write_calls,
 )
 from codeatlas.ingest.symbols import (
+    decode_source,
     detect_language,
     extract_call_sites,
     extract_symbols,
@@ -38,6 +39,7 @@ from codeatlas.ingest.walker import BINARY_SNIFF_BYTES, MAX_FILE_BYTES, sniff_bi
 from codeatlas.providers.embedding import EmbeddingProvider
 
 BATCH_FILES = 50
+EMBED_SLICE = 1000  # 每片 chunk 数:embed → 落 Lance/vector_refs → 提交
 
 
 @dataclass
@@ -217,12 +219,6 @@ def index_repo(
 
     lance = lance or LanceStore(settings)
 
-    # 依赖闭包(PLAN §9.4 步骤 4):变更文件的 IMPORTS 入边依赖者,
-    # 其边随目标子树删除而消失,需重建。必须在删除子树**之前**收集
-    # (边还在);M1 只重提依赖者的 imports 重建边,M3 后升级为 CALLS 边重解析。
-    changed_rels = set(cs.changes)
-    dependent_rels = _dependent_files(conn, repo_id, cs.changes) - changed_rels
-
     # 完整性自愈:库中向量不完整的文件并入处理(scan 模式 mtime 跳过/中断残留),
     # 幂等重处理会删旧子树重建,embed_cache 命中不重复计费(no_embed 模式跳过)
     heal_rows = [] if no_embed else conn.execute(
@@ -231,9 +227,27 @@ def index_repo(
         "  AND NOT EXISTS (SELECT 1 FROM vector_refs v WHERE v.chunk_id=c.id))",
         (repo_id,),
     ).fetchall()
-    for r in heal_rows:
+    # 中断续跑:上次在图解析(IMPORTS/CALLS)完成前中断的文件仍是 pending
+    # (含当时被标记的依赖者),整文件重处理以补齐调用/导入边
+    pending_rows = conn.execute(
+        "SELECT path FROM files WHERE repo_id=? AND parse_status='pending'", (repo_id,)
+    ).fetchall()
+    for r in [*heal_rows, *pending_rows]:
         if r["path"] not in cs.changes and (repo.path / r["path"]).exists():
             cs.changes[r["path"]] = "M"
+
+    # 依赖闭包(PLAN §9.4 步骤 4):变更文件的 IMPORTS/CALLS 入边依赖者,
+    # 其边随目标子树删除而消失,需重建。必须在删除子树**之前**、并入自愈/续跑
+    # 文件**之后**收集(重处理同样会级联删掉指向它的边)。
+    changed_rels = set(cs.changes)
+    dependent_rels = _dependent_files(conn, repo_id, cs.changes) - changed_rels
+    # 依赖者与删除同事务标 pending:若中断在边重建之前,下轮据此续跑
+    for part in in_chunks(sorted(dependent_rels)):
+        conn.execute(
+            f"UPDATE files SET parse_status='pending' WHERE repo_id=? "
+            f"AND parse_status='ok' AND path IN ({','.join('?' * len(part))})",
+            [repo_id, *part],
+        )
 
     # ---- 删除 ----
     for rel, status in sorted(cs.changes.items()):
@@ -259,31 +273,37 @@ def index_repo(
         conn.commit()
 
     # ---- 批量 embedding(全部 flush 后;embed 与 close 同一 event loop)----
+    # 按片 embed → 写 Lance/vector_refs → 提交:中断时已完成片保留,
+    # 未完成文件下轮由完整性自愈补齐(embed_cache 命中不重复计费)
     if embed_pending and not no_embed:
         provider = embed_provider or EmbeddingProvider(settings, conn)
         own_provider = embed_provider is None
 
-        async def _run_embed():
+        async def _run_embed() -> int:
+            done = 0
             try:
-                return await provider.embed(
-                    [c for _, _, c in embed_pending], stage="index", repo_id=repo_id
-                )
+                for i in range(0, len(embed_pending), EMBED_SLICE):
+                    part = embed_pending[i:i + EMBED_SLICE]
+                    vectors = await provider.embed(
+                        [c for _, _, c in part], stage="index", repo_id=repo_id
+                    )
+                    lance_rows = [
+                        (chunk_id, repo_id, kind, blob)
+                        for (chunk_id, kind, _), blob in zip(part, vectors, strict=True)
+                    ]
+                    for (lance_id, chunk_id) in lance.add_vectors(lance_rows):
+                        conn.execute(
+                            "INSERT INTO vector_refs(chunk_id, lance_id, model) VALUES(?,?,?)",
+                            (chunk_id, lance_id, provider.s.embed_model),
+                        )
+                    conn.commit()
+                    done += len(vectors)
             finally:
                 if own_provider:
                     await provider.aclose()
+            return done
 
-        vectors = asyncio.run(_run_embed())
-        lance_rows = [
-            (chunk_id, repo_id, kind, blob)
-            for (chunk_id, kind, _), blob in zip(embed_pending, vectors)
-        ]
-        for (lance_id, chunk_id) in lance.add_vectors(lance_rows):
-            conn.execute(
-                "INSERT INTO vector_refs(chunk_id, lance_id, model) VALUES(?,?,?)",
-                (chunk_id, lance_id, provider.s.embed_model),
-            )
-        conn.commit()
-        stats.embedded = len(vectors)
+        stats.embedded = asyncio.run(_run_embed())
 
     # ---- IMPORTS Pass2(含依赖闭包重建)----
     for rel in sorted(dependent_rels):
@@ -301,7 +321,7 @@ def index_repo(
 
     # ---- CALLS Pass2(PLAN §9.4 步骤 4:M3 生效——依赖闭包重解析调用边)----
     for rel in sorted(dependent_rels):
-        cf = light_call_file(conn, repo, rel)
+        cf = light_call_file(conn, repo_id, repo, rel)
         if cf is not None:
             call_files.append(cf)
     call_stats = resolve_and_write_calls(conn, repo_id, call_files)
@@ -309,13 +329,17 @@ def index_repo(
     stats.call_edges_exact = call_stats.exact
     stats.call_edges_heuristic = call_stats.heuristic
 
-    # ---- 基线推进(最后一步,git 模式专属)----
+    # ---- 收尾:图解析完成,pending → ok;基线推进(git 模式专属)同事务 ----
+    conn.execute(
+        "UPDATE files SET parse_status='ok' WHERE repo_id=? AND parse_status='pending'",
+        (repo_id,),
+    )
     if cs.mode == "git" and cs.head_commit:
         conn.execute(
             "UPDATE repos SET indexed_commit=?, last_indexed_at=? WHERE id=?",
             (cs.head_commit, datetime.now(timezone.utc).isoformat(), repo_id),
         )
-        conn.commit()
+    conn.commit()
 
     lance.maybe_create_index()
     # 向量对账:清理 Lance 中不属于任何现存 chunk 的孤儿(中断/重处理残留);
@@ -323,9 +347,16 @@ def index_repo(
     valid_ids = {
         r["chunk_id"] for r in conn.execute("SELECT chunk_id FROM vector_refs")
     }
-    stats.orphan_vectors_deleted = lance.reconcile_orphans(
+    stats.orphan_vectors_deleted, missing = lance.reconcile_orphans(
         valid_ids, expected_rows=len(valid_ids)
     )
+    if missing:  # 引用指向已不存在的向量:撤掉引用,下轮自愈重嵌
+        for part in in_chunks(sorted(missing)):
+            conn.execute(
+                f"DELETE FROM vector_refs WHERE chunk_id IN ({','.join('?' * len(part))})",
+                part,
+            )
+        conn.commit()
     stats.duration_s = time.time() - t0
     if own_conn:
         conn.close()
@@ -341,20 +372,24 @@ def _dependent_files(
     唯有旧 CALLS 边能暴露这种依赖。
     """
     rels = list(changes)
-    if not rels:
-        return set()
-    ph = ",".join("?" * len(rels))
-    rows = conn.execute(
-        f"SELECT DISTINCT df.path AS p FROM edges e "
-        f"JOIN symbols d ON e.dst_id = d.id "
-        f"JOIN files dstf ON d.file_id = dstf.id "
-        f"JOIN symbols s ON e.src_id = s.id "
-        f"JOIN files df ON s.file_id = df.id "
-        f"WHERE e.repo_id = ? AND e.kind IN ('IMPORTS', 'CALLS') "
-        f"AND dstf.path IN ({ph})",
-        [repo_id, *rels],
-    ).fetchall()
-    return {r["p"] for r in rows}
+    if not rels or conn.execute(
+        "SELECT 1 FROM edges WHERE repo_id=? LIMIT 1", (repo_id,)
+    ).fetchone() is None:
+        return set()  # 首次索引:无边可反查
+    out: set[str] = set()
+    for part in in_chunks(rels):
+        ph = ",".join("?" * len(part))
+        out.update(r["p"] for r in conn.execute(
+            f"SELECT DISTINCT df.path AS p FROM edges e "
+            f"JOIN symbols d ON e.dst_id = d.id "
+            f"JOIN files dstf ON d.file_id = dstf.id "
+            f"JOIN symbols s ON e.src_id = s.id "
+            f"JOIN files df ON s.file_id = df.id "
+            f"WHERE e.repo_id = ? AND e.kind IN ('IMPORTS', 'CALLS') "
+            f"AND dstf.path IN ({ph})",
+            [repo_id, *part],
+        ))
+    return out
 
 
 def _light_imports(repo: RepoCfg, rel: str) -> tuple[str, list[str]] | None:
@@ -429,11 +464,37 @@ def _process_file(
         stats.skipped_unknown_ext += 1
         return
 
+    # 单文件隔离:解析/写库出任何异常只记该文件 failed,不中断整次索引
+    # (SAVEPOINT 回滚其半截写入;KeyboardInterrupt 等非 Exception 照常上抛)
+    marks = (len(embed_pending), len(import_refs), len(call_files))
+    if not conn.in_transaction:
+        conn.execute("BEGIN")
+    conn.execute("SAVEPOINT index_file")
+    try:
+        _parse_and_store(
+            conn, repo_id, rel, lang, raw, new_hash, mtime, head_commit,
+            settings, stats, import_refs, embed_pending, call_files,
+        )
+    except Exception:
+        conn.execute("ROLLBACK TO index_file")
+        conn.execute("RELEASE index_file")
+        del embed_pending[marks[0]:], import_refs[marks[1]:], call_files[marks[2]:]
+        persist("failed")
+        stats.parse_failed += 1
+        return
+    conn.execute("RELEASE index_file")
+
+
+def _parse_and_store(
+    conn, repo_id, rel, lang, raw, new_hash, mtime, head_commit,
+    settings, stats, import_refs, embed_pending, call_files,
+) -> None:
     fs = extract_symbols(rel, lang, raw)
+    # pending:图解析(IMPORTS/CALLS Pass2)完成后才置 ok,中断则下轮续跑
     cur = conn.execute(
         "INSERT INTO files(repo_id, path, hash, mtime, parse_status, last_seen_commit) "
         "VALUES(?,?,?,?,?,?)",
-        (repo_id, rel, new_hash, mtime, "ok", head_commit),
+        (repo_id, rel, new_hash, mtime, "pending", head_commit),
     )
     file_id = cur.lastrowid
 
@@ -441,7 +502,7 @@ def _process_file(
     stats.symbols += len(fs.symbols) + 1
     stats.contains_edges += edge_count
 
-    text = raw.decode("utf-8", errors="replace")
+    text = decode_source(raw)
     chunks = chunk_text(text, lang, fs, settings.chunk_max_tokens)
     title_to_local: dict[str, int] = {s.qualified_name: i for i, s in enumerate(fs.symbols)}
     seen_chunk_keys: set = set()

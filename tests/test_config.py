@@ -59,7 +59,6 @@ def test_key_defaults_isolated_from_env_file():
     assert s.chunk_max_tokens == 512
     assert s.sim_threshold == 0.25
     assert s.vector_top_k == 20
-    assert s.context_top_n == 8
     assert s.graph_expand_hops == 2
     assert s.llm_base_url == ""
 

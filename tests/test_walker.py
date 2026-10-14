@@ -44,19 +44,19 @@ def test_walk_extra_exclude():
 
 def test_walk_nested_gitignore(tmp_path):
     (tmp_path / "src" / "gen").mkdir(parents=True)
-    (tmp_path / "src" / "keep.ts").write_text("export const a = 1;\n")
-    (tmp_path / "src" / "gen" / "skip.ts").write_text("export const b = 2;\n")
-    (tmp_path / "src" / ".gitignore").write_text("gen/\n")
-    (tmp_path / "root.txt").write_text("hi\n")
+    (tmp_path / "src" / "keep.ts").write_text("export const a = 1;\n", encoding="utf-8")
+    (tmp_path / "src" / "gen" / "skip.ts").write_text("export const b = 2;\n", encoding="utf-8")
+    (tmp_path / "src" / ".gitignore").write_text("gen/\n", encoding="utf-8")
+    (tmp_path / "root.txt").write_text("hi\n", encoding="utf-8")
     got = rels(walk(repo(tmp_path)))
     assert got == ["root.txt", "src/keep.ts"]
 
 
 def test_walk_sorted_deterministic(tmp_path):
     for name in ("c.txt", "a.txt", "b.txt"):
-        (tmp_path / name).write_text("x")
+        (tmp_path / name).write_text("x", encoding="utf-8")
     (tmp_path / "dir").mkdir()
-    (tmp_path / "dir" / "z.txt").write_text("x")
+    (tmp_path / "dir" / "z.txt").write_text("x", encoding="utf-8")
     assert rels(walk(repo(tmp_path))) == ["a.txt", "b.txt", "c.txt", "dir/z.txt"]
 
 
@@ -67,7 +67,7 @@ def test_walk_missing_root_raises(tmp_path):
 
 def test_walk_records_size_and_mtime(tmp_path):
     f = tmp_path / "f.txt"
-    f.write_text("hello")
+    f.write_text("hello", encoding="utf-8")
     e = walk(repo(tmp_path))[0]
     assert e.size == 5
     assert e.mtime == pytest.approx(f.stat().st_mtime)

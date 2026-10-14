@@ -12,7 +12,7 @@
 | **Agent 会话** | `atlas agent` | 交互式多轮带记忆问答:上下文跨问题保留,适合连续追问;`/exit` 或 Ctrl-D 关闭会话 |
 | **wiki 文档** | `atlas wiki <repo>` | 生成 zread 风格的代码导读(章节目录/面包屑/上下页导航,行内引用可点击跳转源码) |
 | **OB 索引体检** | `atlas collect / audit` | 解析 OceanBase DDL + 提取代码中的 SQL 访问路径 + 慢查询证据,输出索引合理性报告(无主键/冗余索引/高频条件列无索引/扫描返回比异常等 10 条规则) |
-| **运维** | `atlas status / cost / doctor / repair-vectors` | 库状态、费用流水、端点体检、向量表修复 |
+| **运维** | `atlas update / status / cost / doctor` | 一条龙增量更新、库状态、费用流水、端点体检 |
 
 工作原理:tree-sitter 提取符号与调用边(每条边带 exact/heuristic 置信标签)→ 按符号切块(真实行号)→ LanceDB 向量 + SQLite FTS5 全文双路召回 → RRF 融合 → 图扩展(调用/导入关系);问答由 LLM 工具循环消费这些能力(search/callers/impact/read_file)。全部数据本地存储(SQLite + LanceDB 文件目录)。
 
@@ -104,7 +104,8 @@ atlas wiki my-service            # 生成代码导读(data/wiki/<repo>/README.md
 
 | 命令 | 说明 |
 |---|---|
-| `atlas wiki <repo> [--concise] [--max-pages N]` | 生成章节式代码导读;人工改过的页永不被覆盖 |
+| `atlas wiki [repo] [--concise] [--max-pages N]` | 生成章节式代码导读(缺省遍历全部已索引仓库);人工改过或 front-matter 标 `reviewed: true` 的页永不被覆盖,单页失败不影响其它页 |
+| `atlas update [--concise] [--no-wiki]` | 一条龙:`index`(全部增量)→ `wiki`(全部已索引仓库);任一步失败即非零退出 |
 | `atlas status / cost [--by-model] / doctor` | 库状态 / 费用 / 端点体检 |
 
 ## 配置与数据
@@ -117,7 +118,8 @@ atlas wiki my-service            # 生成代码导读(data/wiki/<repo>/README.md
 LLM_BASE_URL / LLM_API_KEY / LLM_MODEL     # OpenAI 兼容对话端点
 EMBED_BASE_URL / EMBED_API_KEY / EMBED_MODEL / EMBED_DIM   # 向量端点(维度必须匹配,doctor 会校验)
 MAX_CONCURRENCY=4                            # API 并发
-COST_LIMIT_PER_RUN=50                        # 单次命令费用上限(元),超出自动中断
+COST_LIMIT_PER_RUN=50                        # 单次命令费用上限(元),逐批检查,超出立即中断
+LLM_THINKING_CONTROL=true                    # 发送 thinking:{type:disabled}(GLM 系);OpenAI 官方等报 400 时设 false
 ```
 
 **费用**:所有 API 调用记流水(`atlas cost` 可查);嵌入按内容哈希缓存,重复索引不重复计费;换 embedding 模型需全量重嵌(`rm -rf <data>/lancedb && atlas index --full`)。
@@ -125,7 +127,8 @@ COST_LIMIT_PER_RUN=50                        # 单次命令费用上限(元),超
 ## 日常更新
 
 ```bash
-atlas index               # 代码更新后:增量(只重解析变更文件+依赖闭包)
+atlas update              # 代码更新后一条龙:index 增量 + wiki 重生成
+atlas index               # 只更新索引:增量(只重解析变更文件+依赖闭包;中断后重跑自动续上)
 atlas wiki <repo>         # 代码更新后:过期页自动标记,重跑生成(人工改过的写 .suggested.md)
 atlas index-docs          # 你自己的文档改了
 atlas collect --import-slow <新慢查询文件> && atlas audit   # 体检材料更新
@@ -134,7 +137,7 @@ atlas collect --import-slow <新慢查询文件> && atlas audit   # 体检材料
 ## 开发
 
 ```bash
-uv sync && uv run pytest        # 180 个测试(网络层全部 mock)
+uv sync && uv run pytest        # 251 个测试(网络层全部 mock)
 ```
 
 - wiki prompt 版本化于 `src/codeatlas/gencode/prompts/`(改动须升版本);

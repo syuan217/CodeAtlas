@@ -21,36 +21,56 @@ class CallEdge:
     dst_file: str | None
 
 
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def find_symbols(
     conn: sqlite3.Connection, pattern: str, repo_id: int | None = None
 ) -> list[dict]:
-    """符号查找:qualified_name 精确 → name 精确 → 尾段匹配,返回带文件路径的行。"""
-    where = "WHERE s.repo_id = ?" if repo_id is not None else ""
-    params: list = [repo_id] if repo_id is not None else []
-    rows = conn.execute(
-        f"SELECT s.*, f.path AS fpath FROM symbols s JOIN files f ON s.file_id=f.id "
-        f"{where} AND s.qualified_name = ? AND s.kind != 'module'",
-        [*params, pattern],
-    ).fetchall()
+    """符号查找,逐级放宽、首个有结果的层级即返回:
+
+    1. qualified_name 精确;2. name 精确;
+    3. 限定名后缀('Order#name' 命中 com.x.Order#name 及其重载 @行号);
+    4. 兜底:尾段同名或限定名包含。
+    返回行带 fpath(文件)与 repo(仓库名)。
+    """
+    base = (
+        "SELECT s.*, f.path AS fpath, r.name AS repo FROM symbols s "
+        "JOIN files f ON s.file_id=f.id JOIN repos r ON s.repo_id=r.id "
+        "WHERE s.kind != 'module'"
+        + (" AND s.repo_id = ?" if repo_id is not None else "")
+    )
+    scope: list = [repo_id] if repo_id is not None else []
+
+    def q(cond: str, params: list, tail: str = " ORDER BY s.qualified_name") -> list[dict]:
+        return [dict(r) for r in conn.execute(f"{base} AND {cond}{tail}", [*scope, *params])]
+
+    rows = q("s.qualified_name = ?", [pattern])
     if rows:
-        return [dict(r) for r in rows]
-    rows = conn.execute(
-        f"SELECT s.*, f.path AS fpath FROM symbols s JOIN files f ON s.file_id=f.id "
-        f"{where} AND s.name = ? AND s.kind != 'module' ORDER BY s.qualified_name",
-        [*params, pattern],
-    ).fetchall()
+        return rows
+    rows = q("s.name = ?", [pattern])
     if rows:
-        return [dict(r) for r in rows]
+        return rows
     tail = pattern.rsplit(".", 1)[-1].rsplit("#", 1)[-1]
     if tail == pattern:
         return []
-    rows = conn.execute(
-        f"SELECT s.*, f.path AS fpath FROM symbols s JOIN files f ON s.file_id=f.id "
-        f"{where} AND (s.name = ? OR s.qualified_name LIKE ?) AND s.kind != 'module' "
-        f"ORDER BY s.qualified_name LIMIT 50",
-        [*params, tail, f"%{pattern}%"],
-    ).fetchall()
-    return [dict(r) for r in rows]
+    esc = _like_escape(pattern)
+    # LIKE 对 ASCII 不区分大小写:SQL 粗筛 + Python 按段边界('.' 或 TS 模块路径 '/')精确复核
+    rows = [
+        r for r in q("s.qualified_name LIKE ? ESCAPE '\\'", [f"%{esc}%"])
+        if any(
+            r["qualified_name"].endswith(sep + pattern) or f"{sep}{pattern}@" in r["qualified_name"]
+            for sep in (".", "/")
+        )
+    ]
+    if rows:
+        return rows
+    return q(
+        "(s.name = ? OR s.qualified_name LIKE ? ESCAPE '\\')",
+        [tail, f"%{esc}%"],
+        " ORDER BY s.qualified_name LIMIT 50",
+    )
 
 
 def _call_rows(conn, where: str, params: list) -> list[CallEdge]:
@@ -119,11 +139,11 @@ def impact_of(
 
 
 def call_edges_stats(conn: sqlite3.Connection, repo_id: int | None = None) -> dict:
-    where = "WHERE e.repo_id = ?" if repo_id is not None else ""
+    where = " AND e.repo_id = ?" if repo_id is not None else ""
     params = [repo_id] if repo_id is not None else []
     rows = conn.execute(
         f"SELECT e.resolution, COUNT(*) AS c FROM edges e "
-        f"{where} AND e.kind='CALLS' GROUP BY e.resolution",
+        f"WHERE e.kind='CALLS'{where} GROUP BY e.resolution",
         params,
     ).fetchall()
     return {r["resolution"] or "unknown": r["c"] for r in rows}

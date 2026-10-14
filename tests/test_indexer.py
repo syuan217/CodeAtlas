@@ -10,7 +10,7 @@ import pytest
 
 from codeatlas.config import RepoCfg
 from codeatlas.db.fts import fts_search
-from conftest import FIXTURES, Env, FakeEmbedServer, copy_fixture, git_
+from conftest import FIXTURES, Env, copy_fixture, git_
 
 
 def chunk_ids_by_file(env: Env) -> dict[str, set[int]]:
@@ -119,7 +119,7 @@ def test_modify_one_file_only_that_file_reprocessed(env, tmp_path):
     (repo_root / "com/example/util/Strings.java").write_text(
         "package com.example.util;\n\npublic class Strings {\n"
         "    public static String pad(String s, int n) {\n        return s;\n    }\n}\n"
-    )
+    , encoding="utf-8")
 
     stats2 = env.run(repo)
     assert stats2.modified == 1
@@ -168,9 +168,9 @@ def test_delete_file_cleans_subtree(env, tmp_path):
 def test_binary_large_unknown_skipped(env, tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
-    (root / "a.txt").write_text("text file")
+    (root / "a.txt").write_text("text file", encoding="utf-8")
     (root / "b.dat").write_bytes(bytes([0x00, 0x01, 0x00]) * 600)
-    (root / "big.py").write_text("x = 1\n" * 200000)  # ~1.2MB
+    (root / "big.py").write_text("x = 1\n" * 200000, encoding="utf-8")  # ~1.2MB
     repo = RepoCfg(name="mix", path=root)
     stats = env.run(repo)
     assert stats.skipped_unknown_ext == 1  # a.txt
@@ -209,7 +209,7 @@ def test_git_mode_baseline_advances(env, tmp_path):
     assert stats2.added + stats2.modified + stats2.deleted == 0
 
     # 改一个文件 + commit → 只处理该文件,基线推进
-    (root / "pkg/mod.py").write_text("MAX = 200\n\n\ndef only(v):\n    return v\n")
+    (root / "pkg/mod.py").write_text("MAX = 200\n\n\ndef only(v):\n    return v\n", encoding="utf-8")
     git_(root, "add", "-A")
     git_(root, "commit", "-m", "mod")
     stats3 = env.run(repo)
@@ -229,7 +229,7 @@ def test_git_dirty_falls_back_to_scan_and_still_works(env, tmp_path):
     env.run(repo)
 
     # 未提交改动 → scan 兜底;mtime 未变的文件在变更集阶段快跳
-    (root / "main.py").write_text("from pkg.mod import Counter\n\ndef go():\n    return 1\n")
+    (root / "main.py").write_text("from pkg.mod import Counter\n\ndef go():\n    return 1\n", encoding="utf-8")
     stats2 = env.run(repo)
     assert stats2.mode == "scan"
     assert stats2.modified == 1
@@ -271,9 +271,9 @@ def test_exclude_filters_git_changesets_too(env, tmp_path):
     root = tmp_path / "grepo"
     root.mkdir()
     (root / "src").mkdir()
-    (root / "src" / "A.java").write_text("package a;\npublic class A {}\n")
+    (root / "src" / "A.java").write_text("package a;\npublic class A {}\n", encoding="utf-8")
     (root / "sub" / "target").mkdir(parents=True)  # 模拟历史误提交的产物
-    (root / "sub" / "target" / "Gen.class.lst").write_text("noise")
+    (root / "sub" / "target" / "Gen.class.lst").write_text("noise", encoding="utf-8")
     git_(root, "init")
     git_(root, "add", "-A")  # target 产物也 tracked
     git_(root, "commit", "-m", "init")
@@ -363,7 +363,7 @@ def test_duplicate_chunks_within_file_deduped(env, tmp_path):
     root.mkdir()
     dup = ("# T" + chr(10) * 2 + "## A" + chr(10) * 2 + "same line" + chr(10) * 2
             + "## A" + chr(10) * 2 + "same line" + chr(10) * 2 + "## Z")  # 中间两块完全相同
-    (root / "dup.md").write_text(dup)
+    (root / "dup.md").write_text(dup, encoding="utf-8")
     repo = RepoCfg(name="dup", path=root)
     stats = env.run(repo)
     assert stats.chunks >= 1  # 不炸,重复块被去重
@@ -371,3 +371,126 @@ def test_duplicate_chunks_within_file_deduped(env, tmp_path):
         "SELECT COUNT(*) AS c FROM chunks WHERE content LIKE '%same line%'"
     )["c"]
     assert n == 1
+
+
+def test_dependent_files_many_paths(env):
+    """首个 git 索引会把 ls-files 全量路径传入:不得超 SQLite 变量上限。"""
+    from codeatlas.ingest.indexer import _dependent_files
+
+    env.conn.execute("INSERT INTO repos(name,path,languages) VALUES('big','/x','[]')")
+    rid = env.one("SELECT id FROM repos WHERE name='big'")["id"]
+    changes = {f"src/f{i}.py": "A" for i in range(40_000)}
+    assert _dependent_files(env.conn, rid, changes) == set()
+
+
+def _calls(env, repo="r"):
+    return {
+        (r["s"], r["d"]) for r in env.q(
+            "SELECT a.qualified_name AS s, b.qualified_name AS d FROM edges e "
+            "JOIN symbols a ON a.id=e.src_id JOIN symbols b ON b.id=e.dst_id "
+            "JOIN repos rp ON rp.id=e.repo_id WHERE e.kind='CALLS' AND rp.name=?", repo)
+    }
+
+
+def _py_repo(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "x.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+    (root / "y.py").write_text("from x import helper\n\n\ndef run():\n    return helper()\n", encoding="utf-8")
+    return root
+
+
+def test_gbk_file_indexed_with_readable_chunks(env, tmp_path):
+    root = tmp_path / "g"
+    (root / "com/x").mkdir(parents=True)
+    (root / "com/x/G.java").write_bytes(
+        ('package com.x;\npublic class G {\n    /** 订单校验 */\n'
+         '    public boolean ok(String x) { return "中文".equals(x); }\n}\n').encode("gbk"))
+    env.run(RepoCfg(name="g", path=root))
+    assert env.one("SELECT parse_status FROM files WHERE path='com/x/G.java'")[0] == "ok"
+    assert fts_search(env.conn, "订单校验") or any(
+        "订单校验" in r["content"] for r in env.q("SELECT content FROM chunks"))
+
+
+def test_one_bad_file_does_not_abort_run(env, tmp_path, monkeypatch):
+    import codeatlas.ingest.indexer as idx
+
+    root = _py_repo(tmp_path / "r")
+    (root / "boom.py").write_text("def boom():\n    pass\n", encoding="utf-8")
+    real = idx.extract_symbols
+
+    def flaky(rel, lang, raw):
+        if rel == "boom.py":
+            raise RuntimeError("parser exploded")
+        return real(rel, lang, raw)
+
+    monkeypatch.setattr(idx, "extract_symbols", flaky)
+    stats = env.run(RepoCfg(name="r", path=root))
+    status = {r["path"]: r["parse_status"] for r in env.q("SELECT path, parse_status FROM files")}
+    assert status["boom.py"] == "failed" and status["x.py"] == "ok"
+    assert stats.parse_failed >= 1
+    assert ("y.run", "x.helper") in _calls(env)
+    assert env.count("symbols") == env.one(
+        "SELECT COUNT(*) FROM symbols s JOIN files f ON f.id=s.file_id")[0]  # 无半截残留
+
+
+def test_same_fqcn_in_two_maven_modules(env, tmp_path):
+    """多模块 Maven 工程同 FQCN:不得撞 UNIQUE(repo_id, qualified_name) 中断索引。"""
+    root = tmp_path / "mvn"
+    for m in ("m1", "m2"):
+        d = root / m / "src/main/java/com/x"
+        d.mkdir(parents=True)
+        (d / "App.java").write_text("package com.x;\npublic class App { void run() {} }\n", encoding="utf-8")
+    env.run(RepoCfg(name="mvn", path=root))
+    from codeatlas.graph.queries import find_symbols
+
+    assert len(find_symbols(env.conn, "com.x.App")) == 2
+
+
+def test_interrupted_first_index_recovers_call_edges(env, tmp_path, monkeypatch):
+    import codeatlas.ingest.indexer as idx
+
+    root = _py_repo(tmp_path / "r")
+    real = idx.resolve_and_write_calls
+    monkeypatch.setattr(idx, "resolve_and_write_calls",
+                        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        env.run(RepoCfg(name="r", path=root))
+    monkeypatch.setattr(idx, "resolve_and_write_calls", real)
+    env.run(RepoCfg(name="r", path=root))
+    assert ("y.run", "x.helper") in _calls(env)
+
+
+def test_interrupted_incremental_keeps_dependent_edges(env, tmp_path, monkeypatch):
+    """改 x.py 后在图解析前中断:重跑必须恢复依赖者 y.py → x.helper 的调用边。"""
+    import time
+
+    import codeatlas.ingest.indexer as idx
+
+    root = _py_repo(tmp_path / "r")
+    env.run(RepoCfg(name="r", path=root))
+    assert ("y.run", "x.helper") in _calls(env)
+    time.sleep(0.01)
+    (root / "x.py").write_text("def helper():\n    return 2\n", encoding="utf-8")
+    real = idx.resolve_and_write_calls
+    monkeypatch.setattr(idx, "resolve_and_write_calls",
+                        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        env.run(RepoCfg(name="r", path=root))
+    monkeypatch.setattr(idx, "resolve_and_write_calls", real)
+    env.run(RepoCfg(name="r", path=root))
+    assert ("y.run", "x.helper") in _calls(env)
+    assert env.one("SELECT COUNT(*) FROM files WHERE parse_status='pending'")[0] == 0
+
+
+def test_dangling_vector_refs_are_healed(env, tmp_path):
+    """向量被删但引用还在(删 Lance 后 SQL 未提交即中断):对账撤引用,下轮自愈重嵌。"""
+    root = _py_repo(tmp_path / "r")
+    env.run(RepoCfg(name="r", path=root))
+    lance = env.lance()
+    victim = env.one("SELECT chunk_id FROM vector_refs LIMIT 1")["chunk_id"]
+    lance.delete_by_chunk_ids([victim])
+    env.run(RepoCfg(name="r", path=root))     # 对账发现缺失 → 撤引用
+    env.run(RepoCfg(name="r", path=root))     # 自愈重嵌
+    ids = set(env.lance().table.to_arrow().column("chunk_id").to_pylist())  # 新句柄读最新版本
+    refs = {r["chunk_id"] for r in env.q("SELECT chunk_id FROM vector_refs")}
+    assert refs == ids and refs

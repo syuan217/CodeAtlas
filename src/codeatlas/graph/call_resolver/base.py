@@ -77,7 +77,7 @@ class ResolveContext:
     # 函数/方法名 → 符号(重名/重载为多元素)
     methods_by_name: dict[str, list[SymInfo]] = field(default_factory=dict)
     # 类/接口:qualified_name → 符号;类短名 → 符号列表(java 同短名多包)
-    classes_by_qname: dict[str, SymInfo] = field(default_factory=dict)
+    classes_by_qname: dict[str, SymInfo | None] = field(default_factory=dict)
     classes_by_name: dict[str, list[SymInfo]] = field(default_factory=dict)
     # 类 qname → 类内方法列表
     methods_of_class: dict[str, list[SymInfo]] = field(default_factory=dict)
@@ -116,7 +116,9 @@ def build_context(conn: sqlite3.Connection, repo_id: int) -> ResolveContext:
             ctx.rel_by_module_id[info.id] = info.file_rel
             continue
         if info.kind in (SYM_CLASS, SYM_INTERFACE):
-            ctx.classes_by_qname[info.qualified_name] = info
+            # 同 FQCN 多文件(多模块工程)= 歧义,置 None 让解析器丢弃而不是随机绑一个
+            q = info.qualified_name
+            ctx.classes_by_qname[q] = None if q in ctx.classes_by_qname else info
             ctx.classes_by_name.setdefault(info.name, []).append(info)
         else:
             ctx.methods_by_name.setdefault(info.name, []).append(info)

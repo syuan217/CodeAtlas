@@ -12,7 +12,7 @@ from pathlib import Path
 
 from codeatlas import config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = """
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -50,7 +50,9 @@ CREATE TABLE IF NOT EXISTS symbols(
   line_start INTEGER, line_end INTEGER, -- 1-based,含签名行
   signature TEXT                        -- 签名行文本(切块/展示用)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_sym_qname ON symbols(repo_id, qualified_name);
+-- 非唯一:多模块 Maven 工程同 FQCN、src/util.ts 与 src/util.js 同模块名都真实存在;
+-- 同文件内重名(重载)由 symbols.dedup_qnames 加 @行号 消歧,跨文件重名由解析器按歧义处理
+CREATE INDEX IF NOT EXISTS idx_sym_qname ON symbols(repo_id, qualified_name);
 CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(repo_id, name);   -- 同名兜底解析用
 
@@ -66,6 +68,10 @@ CREATE TABLE IF NOT EXISTS edges(
 );
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(repo_id, src_id, kind);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(repo_id, dst_id, kind);
+-- 单列索引:ON DELETE CASCADE 与 callers/impact 按 src_id/dst_id 查找用不上上面
+-- 以 repo_id 打头的复合索引,缺它们时每删一个符号就全表扫 edges/chunks
+CREATE INDEX IF NOT EXISTS idx_edges_src_id ON edges(src_id);
+CREATE INDEX IF NOT EXISTS idx_edges_dst_id ON edges(dst_id);
 
 CREATE TABLE IF NOT EXISTS chunks(
   id INTEGER PRIMARY KEY,
@@ -81,6 +87,8 @@ CREATE TABLE IF NOT EXISTS chunks(
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_dedup
   ON chunks(repo_id, kind, file_id, coalesce(symbol_id,0), content_hash);
+CREATE INDEX IF NOT EXISTS idx_chunks_file ON chunks(file_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(symbol_id);
 
 CREATE TABLE IF NOT EXISTS vector_refs(              -- document_vectors 思路:引用归 SQL 管
   chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
@@ -153,9 +161,21 @@ CREATE TABLE IF NOT EXISTS usage_log(                -- 费用流水(表名避�
   cost REAL NOT NULL
 );
 
--- FTS5(外部内容表;chunks 增删改由 indexer 显式同步,不用触发器)
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(content, content='chunks', content_rowid='id');
+-- FTS5(无内容表:索引 db/fts.fts_text 预处理后的文本——中文二元组 + 驼峰拆分;
+-- 原文只在 chunks。增删由 indexer 等显式同步,不用触发器)
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(content, content='');
 """
+
+
+# IN (?,?,…) 单条语句的参数个数上限:SQLite 默认 SQLITE_MAX_VARIABLE_NUMBER=32766,
+# 大仓库首索引的路径/哈希清单会超,统一按此分片查询
+IN_CHUNK = 500
+
+
+def in_chunks(items: list, size: int = IN_CHUNK):
+    """按 size 切片,供 IN 查询分批绑定参数。"""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 def connect(path: Path | None = None) -> sqlite3.Connection:
@@ -170,9 +190,28 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
+    """按版本顺序升级已有库(新库建表即最新,不走这里)。"""
+    if from_version < 2:
+        # v2:FTS 改为无内容表 + 预处理文本(中文二元组/驼峰拆分),并修复
+        # wiki/report/doc chunk 此前未入 FTS、重跑对未入索引的行发 'delete' 可能写坏索引
+        # 的问题 → 删表按新定义重建,再按 chunks 全量重灌
+        from codeatlas.db.fts import fts_rebuild
+
+        conn.execute("DROP TABLE IF EXISTS chunks_fts")
+        conn.execute("CREATE VIRTUAL TABLE chunks_fts USING fts5(content, content='')")
+        fts_rebuild(conn)
+        # v2:idx_sym_qname 由 UNIQUE 改为普通索引(跨文件同限定名曾撞约束中断整次索引)
+        conn.execute("DROP INDEX IF EXISTS idx_sym_qname")
+        conn.execute("CREATE INDEX idx_sym_qname ON symbols(repo_id, qualified_name)")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
-    """建表(幂等)并记录 schema_version。"""
+    """建表(幂等)、按需迁移,并记录 schema_version。"""
     conn.executescript(DDL)
+    row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    if row is not None and int(row[0]) < SCHEMA_VERSION:
+        _migrate(conn, int(row[0]))
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

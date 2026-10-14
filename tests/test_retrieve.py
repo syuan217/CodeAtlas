@@ -3,8 +3,6 @@
 import pytest
 
 from codeatlas.config import RepoCfg
-from codeatlas.retrieve.context import build_context
-from codeatlas.retrieve.rerank import candidate_pool_size, maybe_rerank
 from codeatlas.retrieve.search import (
     distance_to_similarity,
     extract_identifiers,
@@ -114,43 +112,71 @@ async def test_fts_recall_camel_split(senv):
     assert any(file_of(senv, c.chunk_id) == "src/order.ts" for c in cands[:3])
 
 
-# ---------------------------------------------------------------------------
-# 上下文组装
-# ---------------------------------------------------------------------------
+def _fts_db(tmp_path, docs: dict[int, str]):
+    from codeatlas.db.fts import fts_insert
+    from codeatlas.db.models import connect, init_db
 
-async def test_build_context_format_and_budget(senv):
-    cands = await do_retrieve(senv, "如何实现字符串截断 truncate")
-    ctx, used = build_context(senv.conn, cands, top_n=8, budget_tokens=10 ** 6)
-    assert ctx
-    assert "### 文件:" in ctx
-    assert "[lines " in ctx
-    assert len(used) <= 8
-
-    # 极小预算:装填受限,不抛错
-    ctx2, used2 = build_context(senv.conn, cands, top_n=8, budget_tokens=5)
-    assert len(used2) < len(used) or not ctx2
+    conn = connect(tmp_path / "fts.sqlite")
+    init_db(conn)
+    conn.execute("INSERT INTO repos(name,path,languages) VALUES('r','','[]')")
+    for cid, text in docs.items():
+        conn.execute("INSERT INTO chunks(id,repo_id,kind,content,content_hash) "
+                     "VALUES(?,1,'code',?,?)", (cid, text, f"h{cid}"))
+        fts_insert(conn, cid, text)
+    conn.commit()
+    return conn
 
 
-async def test_build_context_file_grouping(senv):
-    cands = await do_retrieve(senv, "validate 校验用户 user")
-    ctx, _ = build_context(senv.conn, cands, top_n=8, budget_tokens=10 ** 6)
-    # 同文件 chunk 应聚合在同一个文件节内
-    assert ctx.count("### 文件:com/example/service/UserService.java") <= 1
+def test_fts_chinese_phrase_inside_longer_run(tmp_path):
+    """unicode61 把连续汉字当一个词:'订单创建流程:…' 曾无法被'订单创建'类问题命中。"""
+    from codeatlas.retrieve.search import _fts_recall
+
+    conn = _fts_db(tmp_path, {1: "// 订单创建流程:校验库存后落库", 2: "// 用户登录"})
+    assert _fts_recall(conn, "订单创建流程是怎样的", None)[0] == 1
+    assert _fts_recall(conn, "库存校验在哪", None)[0] == 1
+    conn.close()
 
 
-# ---------------------------------------------------------------------------
-# rerank
-# ---------------------------------------------------------------------------
+def test_fts_camel_case_identifier(tmp_path):
+    from codeatlas.retrieve.search import _fts_recall
 
-def test_candidate_pool_size():
-    assert candidate_pool_size(50) == 10
-    assert candidate_pool_size(5000) == 50
-    assert candidate_pool_size(300) == 30
+    conn = _fts_db(tmp_path, {
+        1: "return orderService.createOrder(req);",
+        2: "void cancel() {}",
+    })
+    assert _fts_recall(conn, "createOrder 在哪", None)[0] == 1
+    assert _fts_recall(conn, "create order", None)[0] == 1
+    conn.close()
 
 
-def test_maybe_rerank_disabled_passthrough(senv):
-    from codeatlas.retrieve.search import Candidate
+def test_fts_delete_roundtrip_with_preprocessing(tmp_path):
+    from codeatlas.db.fts import fts_delete
 
-    cands = [Candidate(chunk_id=i) for i in range(80)]
-    out = maybe_rerank("q", cands, senv.settings, corpus_size=1000)
-    assert out == cands  # 默认关闭,原样返回
+    conn = _fts_db(tmp_path, {1: "订单 createOrder 流程", 2: "订单 其它"})
+    fts_delete(conn, 1, "订单 createOrder 流程")
+    conn.execute("DELETE FROM chunks WHERE id=1")
+    conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")
+    from codeatlas.retrieve.search import _fts_recall
+    assert _fts_recall(conn, "订单", None) == [2]
+    conn.close()
+
+
+def test_symbol_recall_skips_overly_generic_words(tmp_path):
+    """问题里的普通词(如 init)匹配上百个同名符号时不进图扩展,免得结果被噪声淹没、查询变慢。"""
+    from codeatlas.db.models import connect, init_db
+    from codeatlas.retrieve.search import _symbol_recall
+
+    conn = connect(tmp_path / "s.sqlite")
+    init_db(conn)
+    conn.execute("INSERT INTO repos(name,path,languages) VALUES('r','','[]')")
+    conn.execute("INSERT INTO files(id,repo_id,path) VALUES(1,1,'a.py')")
+    for i in range(40):
+        conn.execute("INSERT INTO symbols(repo_id,file_id,kind,name,qualified_name) "
+                     "VALUES(1,1,'method','init',?)", (f"C{i}#init",))
+    conn.execute("INSERT INTO symbols(repo_id,file_id,kind,name,qualified_name) "
+                 "VALUES(1,1,'method','settleOrder','Svc#settleOrder')")
+    sym_ids, _ = _symbol_recall(conn, "init 之后 settleOrder 怎么走", None)
+    names = {r[0] for r in conn.execute(
+        f"SELECT name FROM symbols WHERE id IN ({','.join(map(str, sym_ids))})")}
+    assert names == {"settleOrder"}
+    conn.close()

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -21,13 +22,18 @@ from pathlib import Path
 import sqlglot
 from sqlglot import exp
 
-_TAG_RE = re.compile(r"</?(if|where|foreach|set|trim|choose|when|otherwise|bind|sql|include)[^>]*>", re.I)
+_TAG_RE = re.compile(
+    r"</?(if|where|foreach|set|trim|choose|when|otherwise|bind|sql|include|script)[^>]*>", re.I
+)
+# 属性值单/双引号都合法(id='x' 也常见)
 _STMT_TAGS = re.compile(
-    r"<(select|insert|update|delete)\b[^>]*?id=\"([^\"]+)\"[^>]*>(.*?)</\1>",
+    r"<(select|insert|update|delete)\b[^>]*?\bid=[\"']([^\"']+)[\"'][^>]*>(.*?)</\1>",
     re.S | re.I,
 )
-_SQL_FRAG = re.compile(r"<sql\b[^>]*?id=\"([^\"]+)\"[^>]*>(.*?)</sql>", re.S | re.I)
-_INCLUDE = re.compile(r"<include\b[^>]*?refid=\"([^\"]+)\"[^>]*/>", re.I)
+_SQL_FRAG = re.compile(r"<sql\b[^>]*?\bid=[\"']([^\"']+)[\"'][^>]*>(.*?)</sql>", re.S | re.I)
+_INCLUDE = re.compile(r"<include\b[^>]*?refid=[\"']([^\"']+)[\"'][^>]*/>", re.I)
+_TRIM = re.compile(r"<trim\b([^>]*)>(.*?)</trim>", re.S | re.I)
+_XML_COMMENT = re.compile(r"<!--.*?-->", re.S)
 _PARAM = re.compile(r"[$#]\{[^}]*\}")
 _LEAD_AND = re.compile(r"^\s*(AND|OR)\b", re.I)
 _ANNOTATION = re.compile(
@@ -74,14 +80,27 @@ def fingerprint_sql(sql: str) -> str:
     return hashlib.blake2b(norm.encode(), digest_size=12).hexdigest()
 
 
+def _trim_tag(m: re.Match) -> str:
+    """<trim prefix=".." suffix=".."> → 前后缀落地;prefix=WHERE 同 <where> 用 1=1 吸收前导 AND。"""
+    attrs = dict(re.findall(r"(\w+)\s*=\s*[\"']([^\"']*)[\"']", m.group(1)))
+    prefix, suffix = attrs.get("prefix", ""), attrs.get("suffix", "")
+    if prefix.strip().upper() == "WHERE":
+        prefix = "WHERE 1=1"
+    return f" {prefix} {m.group(2)} {suffix} "
+
+
 def _clean_dynamic(sql: str) -> str:
-    s = _PARAM.sub("'?'", sql)
-    # <where>/<set> 标签承载关键字语义:剥掉会留下悬挂 AND/OR,转为 WHERE 1=1 技巧
+    s = _XML_COMMENT.sub(" ", sql)
+    s = s.replace("<![CDATA[", " ").replace("]]>", " ")
+    s = _PARAM.sub("'?'", s)
+    # <where>/<set>/<trim> 标签承载关键字语义:剥掉会留下悬挂 AND/OR,转为 WHERE 1=1 技巧
     s = re.sub(r"<where\b[^>]*>(.*?)</where>", r" WHERE 1=1 \1 ", s, flags=re.S | re.I)
     s = re.sub(r"<set\b[^>]*>(.*?)</set>", r" SET \1 ", s, flags=re.S | re.I)
+    s = _TRIM.sub(_trim_tag, s)
     s = _TAG_RE.sub(" ", s)
-    s = re.sub(r"<!--.*?-->", " ", s, flags=re.S)
+    s = html.unescape(s)  # &lt; &gt; &amp; → 比较运算符(须在剥标签之后,免得误伤)
     s = re.sub(r"\s+", " ", s)
+    s = re.sub(r",\s*\)", ")", s)  # suffixOverrides="," 的效果
     s = _LEAD_AND.sub("", s)
     return s.strip().rstrip(",")
 
@@ -104,11 +123,14 @@ def _extract_accesses(stmt: exp.Expression) -> tuple[list[str], list[Access]]:
             seen.add(key)
             accesses.append(Access(table.lower(), column.lower(), usage))
 
-    # where 等值/比较列(列 与 字面量/参数 比较的一侧)
+    # where 等值/比较列(列 与 字面量/参数 比较的一侧);IN / BETWEEN 不是 Binary,单独处理
     for where in stmt.find_all(exp.Where):
-        for pred in where.find_all(exp.Binary):
-            if not isinstance(pred, (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE,
-                                     exp.Like, exp.ILike, exp.In)):
+        for pred in where.find_all(exp.Binary, exp.In, exp.Between):
+            if isinstance(pred, (exp.In, exp.Between)):
+                if isinstance(pred.this, exp.Column):
+                    add(pred.this.table or "", pred.this.name, "where")
+                continue
+            if not isinstance(pred, _COMPARISONS):
                 continue
             left, right = pred.this, pred.expression
             for col, other in ((left, right), (right, left)):
@@ -142,6 +164,9 @@ def _extract_accesses(stmt: exp.Expression) -> tuple[list[str], list[Access]]:
     return tables, accesses
 
 
+_COMPARISONS = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Like, exp.ILike)
+
+
 def _extract_anti_patterns(stmt: exp.Expression, tables: list[str]) -> list[dict]:
     """IDX005 证据:LIKE 前导通配 / where 内函数包裹列。"""
     out: list[dict] = []
@@ -151,23 +176,33 @@ def _extract_anti_patterns(stmt: exp.Expression, tables: list[str]) -> list[dict
         lits = [right] if isinstance(right, exp.Literal) else list(right.find_all(exp.Literal))
         first = next((l for l in lits if l.is_string), None)
         if first is not None and str(first.this).startswith("%"):
-            col = like.this if isinstance(like.this, exp.Column) else None
+            # 左侧可能是函数包裹列(LOWER(name))或常量:取其中第一个列,没有就跳过
+            col = (like.this if isinstance(like.this, exp.Column)
+                   else next(like.this.find_all(exp.Column), None))
+            if col is None:
+                continue
             out.append({
                 "table": (col.table or fallback_table).lower(),
-                "column": col.name if col else "?",
+                "column": col.name,
                 "pattern": "LIKE '%...'",
             })
+    # 函数包裹列:比较的一侧是含列的函数、另一侧不含列(如 DATE_FORMAT(gmt,'%Y')='2024')。
+    # sqlglot 把常见函数解析成具体节点(DateFormat/Year/Cast…),按基类 exp.Func 判断
     for where in stmt.find_all(exp.Where):
-        for call in where.find_all(exp.Anonymous):
-            if call.name and call.name.upper() in ("DATE", "DATE_FORMAT", "SUBSTR",
-                                                   "SUBSTRING", "LEFT", "RIGHT",
-                                                   "CONCAT", "CAST", "TRIM", "YEAR",
-                                                   "MONTH", "DAY", "IF", "IFNULL", "COALESCE"):
-                for col in call.find_all(exp.Column):
+        for pred in where.find_all(*_COMPARISONS, exp.In, exp.Between):
+            sides = [(pred.this, pred.args.get("expression"))]
+            if isinstance(pred, _COMPARISONS):
+                sides.append((pred.expression, pred.this))
+            for side, other in sides:
+                if not isinstance(side, exp.Func) or isinstance(side, exp.Column):
+                    continue
+                if other is not None and other.find(exp.Column) is not None:
+                    continue
+                for col in side.find_all(exp.Column):
                     out.append({
                         "table": (col.table or fallback_table).lower(),
-                        "column": col.name,
-                        "pattern": f"FUNC({col.name})",
+                        "column": col.name.lower(),
+                        "pattern": f"FUNC({col.name.lower()})",
                     })
     return out
 
@@ -179,28 +214,35 @@ def _try_parse(sql: str) -> exp.Expression | None:
         return None
 
 
+def _alias_map(stmt: exp.Expression) -> dict[str, str]:
+    """别名(小写)→ 表名(小写);访问路径的表名已统一小写,别名比较也须小写。"""
+    return {t.alias.lower(): t.name.lower() for t in stmt.find_all(exp.Table) if t.alias}
+
+
 def _resolve_table_alias(stmt: exp.Expression, accesses: list[Access]) -> None:
     """把别名列归属到真实表:alias.col → table.col。"""
-    alias_map: dict[str, str] = {}
-    for t in stmt.find_all(exp.Table):
-        if t.alias:
-            alias_map[t.alias] = t.name
+    alias_map = _alias_map(stmt)
     for a in accesses:
-        if a.table in alias_map:
-            a.table = alias_map[a.table].lower()
-        elif a.table and a.table not in {t.lower() for t in alias_map.values()}:
-            # 无别名限定且与某表名一致(大小写差异)则归一
-            pass
+        a.table = alias_map.get(a.table, a.table)
+
+
+def _resolve_anti_alias(stmt: exp.Expression, anti: list[dict]) -> list[dict]:
+    alias_map = _alias_map(stmt)
+    for ap in anti:
+        ap["table"] = alias_map.get(ap["table"], ap["table"])
+    return anti
 
 
 def extract_from_xml(path: Path, rel: str) -> list[ExtractedQuery]:
     text = path.read_text(encoding="utf-8", errors="replace")
     if "<mapper" not in text:
         return []
+    # 先整体去注释(注释掉的语句不算),换成等量换行保持行号
+    text = _XML_COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), text)
     frags = {m.group(1): m.group(2) for m in _SQL_FRAG.finditer(text)}
     out: list[ExtractedQuery] = []
     for m in _STMT_TAGS.finditer(text):
-        tag, sid, body = m.group(1), m.group(2), m.group(3)
+        tag, body = m.group(1), m.group(3)
         line = text[: m.start()].count("\n") + 1
 
         def _expand(match):
@@ -227,7 +269,7 @@ def extract_from_xml(path: Path, rel: str) -> list[ExtractedQuery]:
                 fingerprint=fingerprint_sql(sql),
                 tables=lowered,
                 accesses=accesses,
-                anti_patterns=_extract_anti_patterns(stmt, lowered),
+                anti_patterns=_resolve_anti_alias(stmt, _extract_anti_patterns(stmt, lowered)),
             )
         )
     return out
@@ -255,28 +297,35 @@ def extract_from_java(path: Path, rel: str) -> list[ExtractedQuery]:
                 fingerprint=fingerprint_sql(sql),
                 tables=lowered,
                 accesses=accesses,
-                anti_patterns=_extract_anti_patterns(stmt, lowered),
+                anti_patterns=_resolve_anti_alias(stmt, _extract_anti_patterns(stmt, lowered)),
             )
         )
 
+    covered: list[tuple[int, int]] = []
     for m in _ANNOTATION.finditer(text):
         _emit(m.group(2), m.start())
+        covered.append(m.span(2))
     for m in _STR_SQL.finditer(text):
+        # 注解里的字符串已按注解提取过,别再按普通字符串算一遍(频次翻倍)
+        if any(a <= m.start(1) and m.end(1) <= b for a, b in covered):
+            continue
         _emit(m.group(1), m.start())
     return out
 
 
 def extract_repo(repo_cfg, repo_root: Path) -> list[ExtractedQuery]:
     """扫一个仓库(尊重 .gitignore/exclude,复用 walker)。"""
-    from codeatlas.config import RepoCfg
     from codeatlas.ingest.walker import walk
 
     queries: list[ExtractedQuery] = []
     for entry in walk(repo_cfg):
-        if entry.rel.endswith(".xml"):
-            queries += extract_from_xml(entry.abs_path, entry.rel)
-        elif entry.rel.endswith(".java"):
-            queries += extract_from_java(entry.abs_path, entry.rel)
+        try:
+            if entry.rel.endswith(".xml"):
+                queries += extract_from_xml(entry.abs_path, entry.rel)
+            elif entry.rel.endswith(".java"):
+                queries += extract_from_java(entry.abs_path, entry.rel)
+        except Exception:
+            continue  # 单文件提取异常(畸形 XML/罕见语法)跳过,不中断整次体检
     return queries
 
 

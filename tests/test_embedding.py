@@ -140,3 +140,66 @@ def test_pack_unpack_roundtrip():
     assert unpack_vector(blob) == pytest.approx(vec)
     # LE 字节序:首元素最低有效字节在前
     assert blob[:4] == struct.pack("<f", 0.25)
+
+
+async def test_cache_lookup_beyond_sqlite_variable_limit(settings, db):
+    """大仓库首索引一次 embed 数万 chunk:缓存查询不得超 SQLite 32766 变量上限。"""
+    from codeatlas.config import content_hash
+
+    texts = [f"t{i}" for i in range(40_000)]
+    blob = pack_vector([0.1] * 4)
+    db.executemany(
+        "INSERT INTO embed_cache(content_hash, model, dim, vector) VALUES(?,?,?,?)",
+        [(content_hash(t), settings.embed_model, 4, blob) for t in texts],
+    )
+    db.commit()
+    server = EmbedServer()
+    async with EmbeddingProvider(settings, db, transport=httpx.MockTransport(server),
+                                 backoff_base=0) as p:
+        out = await p.embed(texts)
+    assert len(out) == 40_000 and server.requests == []
+
+
+async def test_completed_batches_cached_when_later_batch_fails(settings, db):
+    """某批失败:已成功批次的向量与费用必须已落库(重跑命中缓存、不重复付费)。"""
+    from codeatlas.providers._retry import ProviderHttpError
+
+    s = settings.model_copy(update={"max_concurrency": 1, "embed_batch_size": 2})
+    ok = EmbedServer()
+    calls = {"n": 0}
+
+    def flaky(request):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            return httpx.Response(400, json={"error": "bad"})
+        return ok(request)
+
+    texts = [f"t{i}" for i in range(10)]
+    async with EmbeddingProvider(s, db, transport=httpx.MockTransport(flaky),
+                                 backoff_base=0) as p:
+        with pytest.raises(ProviderHttpError):
+            await p.embed(texts)
+    assert db.execute("SELECT COUNT(*) FROM embed_cache").fetchone()[0] == 4
+    assert db.execute("SELECT COALESCE(SUM(prompt_tokens),0) FROM usage_log").fetchone()[0] == 12
+
+    healthy = EmbedServer()
+    async with EmbeddingProvider(s, db, transport=httpx.MockTransport(healthy),
+                                 backoff_base=0) as p:
+        await p.embed(texts)
+    assert sum(len(r["input"]) for r in healthy.requests) == 6  # 只补缺的 6 条
+
+
+async def test_cost_limit_stops_mid_run(settings, db):
+    """费用护栏须逐批生效:超限即停,不能等全部批次跑完(钱已花掉)才报。"""
+    from codeatlas.providers._retry import CostLimitExceeded
+
+    s = settings.model_copy(update={
+        "max_concurrency": 1, "embed_batch_size": 2,
+        "embed_price": 1e6, "cost_limit_per_run": 10.0,  # 每 token 1 元:首批 6 token 即超
+    })
+    server = EmbedServer()
+    async with EmbeddingProvider(s, db, transport=httpx.MockTransport(server),
+                                 backoff_base=0) as p:
+        with pytest.raises(CostLimitExceeded):
+            await p.embed([f"t{i}" for i in range(20)])
+    assert len(server.requests) <= 2  # 10 批里只发出了一两批

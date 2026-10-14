@@ -91,7 +91,7 @@ class LLMProvider:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
-        if thinking_disabled:
+        if thinking_disabled and self.s.llm_thinking_control:
             # 思考型模型(如 GLM 系列):思考内容同样计入输出预算,
             # 长文生成场景须关闭思考,否则正文可能被思考耗尽截断
             payload["thinking"] = {"type": "disabled"}
@@ -108,7 +108,10 @@ class LLMProvider:
                 backoff_base=self.backoff_base,
             )
 
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as e:  # 200 但非 JSON(网关登录页/代理错误页等)
+            raise ProviderError(f"LLM 响应不是 JSON: {resp.text[:300]}") from e
         try:
             content = data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as e:

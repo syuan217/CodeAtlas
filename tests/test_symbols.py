@@ -209,3 +209,85 @@ def test_contains_edges_shape():
     # module→class 是 (None, class_idx);class→method 是 (0, method_idx)
     assert (None, 0) in edges  # User 类挂 module
     assert (0, 1) in edges and (0, 2) in edges and (0, 3) in edges
+
+
+# ---------------------------------------------------------------------------
+# 调用点 caller 归属(注解方法 / 箭头函数 / 类字段箭头函数)
+# ---------------------------------------------------------------------------
+
+def _callers_by_name(fs, sites) -> dict[str, set]:
+    out: dict[str, set] = {}
+    for s in sites:
+        q = fs.symbols[s.caller_local].qualified_name if s.caller_local is not None else None
+        out.setdefault(s.name, set()).add(q)
+    return out
+
+
+def test_java_annotated_method_calls_attributed_to_method():
+    """注解使方法节点起点落在注解行;caller 必须按签名行对齐到方法,而非落到 module。"""
+    from codeatlas.ingest.symbols import extract_call_sites
+
+    src = b"""package com.x;
+public class S {
+    @Override
+    public String toString() { return helper(); }
+
+    @Transactional
+    @SuppressWarnings("unchecked")
+    public void save() {
+        audit();
+    }
+
+    @Autowired
+    public S() { init(); }
+
+    private String helper() { return "a"; }
+    private void audit() {}
+    private void init() {}
+}
+"""
+    fs = extract_symbols("com/x/S.java", "java", src)
+    by_name = _callers_by_name(fs, extract_call_sites("com/x/S.java", "java", src, fs))
+    assert by_name["helper"] == {"com.x.S#toString"}
+    assert by_name["audit"] == {"com.x.S#save"}
+    assert by_name["init"] == {"com.x.S#S"}
+
+
+def test_ts_arrow_and_class_field_calls_attributed():
+    from codeatlas.ingest.symbols import extract_call_sites
+
+    src = b"""import { api } from "./api";
+export const Index = (props: Props) => {
+  const onOk = () => { api.save(props.id); };
+  return load();
+};
+const helper = function () { return fetchAll(); };
+class Page extends Component {
+  handleClick = (e) => { this.props.dispatch(e); };
+  render() { return helper(); }
+}
+boot();
+"""
+    fs = extract_symbols("src/page.tsx", "tsx", src)
+    m = syms_by_qname(fs)
+    assert m["src/page.Page#handleClick"].kind == "method"  # 类字段箭头函数 = 方法
+    by_name = _callers_by_name(fs, extract_call_sites("src/page.tsx", "tsx", src, fs))
+    assert by_name["save"] == {"src/page.Index"}       # 嵌套箭头函数归外层符号
+    assert by_name["load"] == {"src/page.Index"}
+    assert by_name["fetchAll"] == {"src/page.helper"}
+    assert by_name["dispatch"] == {"src/page.Page#handleClick"}
+    assert by_name["helper"] == {"src/page.Page#render"}
+    assert by_name["boot"] == {None}                    # 真正的模块级调用
+
+
+def test_gbk_source_parsed_not_crashing():
+    """GBK 编码(国内老 Java 项目常见)源文件:不得 UnicodeDecodeError 中断整次索引。"""
+    from codeatlas.ingest.symbols import decode_source, extract_call_sites
+
+    src = ('package com.x;\npublic class G {\n    // 中文注释\n'
+           '    public boolean ok(String x) { return "中文".equals(x); }\n}\n').encode("gbk")
+    assert "中文注释" in decode_source(src)
+    fs = extract_symbols("com/x/G.java", "java", src)
+    assert "com.x.G#ok" in syms_by_qname(fs)
+    sites = extract_call_sites("com/x/G.java", "java", src, fs)
+    assert [s.name for s in sites] == ["equals"]
