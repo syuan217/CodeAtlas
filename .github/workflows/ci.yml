@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows 是支持目标;Linux 作对照基线(区分平台相关与通用失败)
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      # fixture 的行号/内容断言依赖 LF;Windows runner 默认 autocrlf=true 会改成 CRLF
+      - name: Configure git
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # Python 版本取 .python-version;--locked 保证与 uv.lock 一致
+      - name: Install
+        run: uv sync --locked
+
+      # 不设 PYTHONUTF8:按 Windows 默认代码页跑,才能暴露隐式编码问题
+      - name: Test
+        run: uv run pytest -q
