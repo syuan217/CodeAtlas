@@ -33,11 +33,28 @@ uv tool install --editable .   # 可选:获得全局 atlas 命令(否则用 uv r
 ```bash
 # 构建侧:产物为单 zip(含主包 + 全部依赖 wheel + INSTALL.md)
 ./scripts/make-bundle.sh
-# 多平台:PLATFORMS="macosx_11_0_arm64 manylinux_2_28_x86_64" ./scripts/make-bundle.sh
+# 多平台:PLATFORMS="macosx_11_0_arm64 manylinux_2_28_x86_64 win_amd64" ./scripts/make-bundle.sh
 
 # 使用侧:解压 zip 后
 uv tool install --offline --find-links ./wheels codeatlas
 ```
+
+### Windows
+
+macOS / Linux / Windows(x64)均受支持,CI 在 Windows 上跑全部测试。安装命令同上(PowerShell 中执行),另需注意:
+
+- **uv**:`powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`;
+  离线包需在 macOS/Linux 上带 `PLATFORMS="win_amd64"` 构建(`make-bundle.sh` 是 bash 脚本);
+- **git**:建议在 PATH 中(增量索引走 `git diff`);没有 git 时自动退回全量 hash 扫描,只是慢一些;
+- **长路径**:Java 多模块工程路径常超 260 字符,请开启系统长路径支持并让 git 也支持:
+  ```powershell
+  # 管理员 PowerShell
+  New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force
+  git config --global core.longpaths true
+  ```
+- **路径写法**:`repos.yaml` / `.env` 里的路径用正斜杠(`D:/code/my-service`)或单引号;
+  YAML 双引号里的反斜杠会被当成转义符;
+- 配置与数据默认在 `C:\Users\<用户名>\.codeatlas`;输出统一 UTF-8(重定向到文件或被其它程序调用也不会乱码)。
 
 ## 快速开始
 
@@ -137,7 +154,7 @@ atlas collect --import-slow <新慢查询文件> && atlas audit   # 体检材料
 ## 开发
 
 ```bash
-uv sync && uv run pytest        # 251 个测试(网络层全部 mock)
+uv sync && uv run pytest        # 260 个测试(网络层全部 mock;CI 覆盖 Windows + Linux)
 ```
 
 - wiki prompt 版本化于 `src/codeatlas/gencode/prompts/`(改动须升版本);

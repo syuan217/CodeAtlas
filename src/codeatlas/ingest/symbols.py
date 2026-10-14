@@ -42,6 +42,13 @@ def detect_language(rel: str) -> str | None:
     return EXT_LANG.get(Path(rel).suffix.lower())
 
 
+def _strip_ext(rel: str) -> str:
+    """去扩展名,保持 rel 的 '/' 分隔(str(Path(...)) 在 Windows 上会变成反斜杠)。"""
+    head, _, name = rel.rpartition("/")
+    stem = name.rsplit(".", 1)[0] if "." in name.lstrip(".") else name
+    return f"{head}/{stem}" if head else stem
+
+
 def decode_source(raw: bytes) -> str:
     """源码字节 → 文本:UTF-8(含 BOM)优先,失败按 GB18030(GBK 超集,国内老项目常见),
     再不行才按 UTF-8 替换非法字节。换行字节在三者中一致,行号不受影响。"""
@@ -352,7 +359,7 @@ def _extract_ts(
     tree, lines: list[str], rel: str
 ) -> tuple[_Collector, list[str], list[ImportBinding]]:
     col = _Collector(lines)
-    mod_qname = str(Path(rel).with_suffix(""))
+    mod_qname = _strip_ext(rel)
     imports: list[str] = []
     bindings: list[ImportBinding] = []
 
@@ -470,7 +477,7 @@ def _extract_go(
     tree, lines: list[str], rel: str
 ) -> tuple[_Collector, list[str], list[ImportBinding]]:
     col = _Collector(lines)
-    mod_qname = str(Path(rel).with_suffix(""))
+    mod_qname = _strip_ext(rel)
     imports: list[str] = []
     bindings: list[ImportBinding] = []
 

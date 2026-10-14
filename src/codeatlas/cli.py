@@ -45,6 +45,29 @@ app = typer.Typer(
 console = Console()
 
 
+def _ensure_utf8_stdio() -> None:
+    """stdout/stderr 不是 UTF-8 时改为 UTF-8。
+
+    Windows 上输出被重定向/管道(`--json > f`、被 Claude Code 等程序调用)时用的是
+    系统代码页(cp936/cp1252),遇到 ⚠️ ❯ 等字符直接 UnicodeEncodeError;
+    控制台本身(WindowsConsoleIO)已是 UTF-8,不受影响。
+    """
+    import sys as _sys
+
+    for name in ("stdout", "stderr"):
+        stream = getattr(_sys, name)
+        enc = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
+        if enc != "utf8" and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
+@app.callback()
+def _main() -> None:
+    _ensure_utf8_stdio()
+
 
 @app.command()
 def status(as_json: bool = typer.Option(False, "--json", help="输出 JSON(Agent 消费)")) -> None:
@@ -364,11 +387,20 @@ async def _run_interruptible(coro):
     """
     loop = asyncio.get_running_loop()
     task = asyncio.ensure_future(coro)
+    restore = None
     try:
         loop.add_signal_handler(signal.SIGINT, task.cancel)
-        installed = True
+        restore = lambda: loop.remove_signal_handler(signal.SIGINT)  # noqa: E731
     except (NotImplementedError, RuntimeError, ValueError):
-        installed = False
+        # Windows 的事件循环不支持 add_signal_handler:退回 signal.signal,
+        # 处理函数里线程安全地取消本问(Proactor 循环靠 wakeup fd 及时醒来)
+        try:
+            prev = signal.signal(
+                signal.SIGINT, lambda *_: loop.call_soon_threadsafe(task.cancel)
+            )
+            restore = lambda: signal.signal(signal.SIGINT, prev)  # noqa: E731
+        except (ValueError, OSError):  # 非主线程:保持默认行为
+            restore = None
     try:
         return await task
     except asyncio.CancelledError:
@@ -376,8 +408,8 @@ async def _run_interruptible(coro):
             return None
         raise
     finally:
-        if installed:
-            loop.remove_signal_handler(signal.SIGINT)
+        if restore is not None:
+            restore()
 
 
 def _make_session_reader():

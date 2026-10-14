@@ -22,6 +22,8 @@ from pathlib import Path
 import sqlglot
 from sqlglot import exp
 
+from codeatlas.ingest.symbols import decode_source
+
 _TAG_RE = re.compile(
     r"</?(if|where|foreach|set|trim|choose|when|otherwise|bind|sql|include|script)[^>]*>", re.I
 )
@@ -234,7 +236,7 @@ def _resolve_anti_alias(stmt: exp.Expression, anti: list[dict]) -> list[dict]:
 
 
 def extract_from_xml(path: Path, rel: str) -> list[ExtractedQuery]:
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text = decode_source(path.read_bytes())  # UTF-8 / GBK 都能读(Windows 上的老工程常见 GBK)
     if "<mapper" not in text:
         return []
     # 先整体去注释(注释掉的语句不算),换成等量换行保持行号
@@ -276,7 +278,7 @@ def extract_from_xml(path: Path, rel: str) -> list[ExtractedQuery]:
 
 
 def extract_from_java(path: Path, rel: str) -> list[ExtractedQuery]:
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text = decode_source(path.read_bytes())
     out: list[ExtractedQuery] = []
 
     def _emit(sql: str, offset: int) -> None:

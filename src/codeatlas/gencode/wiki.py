@@ -8,12 +8,11 @@
 from __future__ import annotations
 
 import asyncio
-import posixpath
 import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from codeatlas import config
 from codeatlas.config import Settings
@@ -121,12 +120,19 @@ def _files_hash(conn: sqlite3.Connection, repo_id: int, paths: list[str]) -> str
     return _agg_hash([f"{p}:{found.get(p, '-')}" for p in paths])
 
 
-def _rel_link(target: Path, from_file: Path) -> str:
-    """目标页相对当前文件的 markdown 链接路径(posix 风格)。"""
-    rel = posixpath.relpath(
-        str(target), str(from_file.parent) if str(from_file.parent) != "" else "."
-    )
-    return rel.replace("\\", "/")
+def _rel_link(target: PurePath, from_file: PurePath) -> str:
+    """目标页相对当前文件的 markdown 链接路径(始终 '/' 分隔)。
+
+    按路径对象计算(不拼字符串):posixpath.relpath 喂 Windows 路径会得到 ../C:/…。
+    """
+    return target.relative_to(from_file.parent, walk_up=True).as_posix()
+
+
+def _file_uri(path: PurePath) -> str:
+    """源码跳转链接:Windows 上是 file:///C:/…,手拼 f"file://{path}" 会得到无效的 file://C:\…。"""
+    if not path.is_absolute():
+        path = Path(path).resolve()
+    return path.as_uri()
 
 
 async def _chat_page(llm: LLMProvider, prompt: str) -> str:
@@ -258,7 +264,7 @@ async def generate_wiki(
 
         def _sub(m):
             target = repo_abs / m.group(1)
-            return f"(file://{target})" if target.exists() else m.group(0)
+            return f"({_file_uri(target)})" if target.exists() else m.group(0)
 
         return _re.sub(r"\(([^)\s:]+):\d+-\d+\)", _sub, md)
 

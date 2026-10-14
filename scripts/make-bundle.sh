@@ -3,7 +3,7 @@
 # 用法:
 #   ./scripts/make-bundle.sh                 # 按当前平台(Intel mac)
 #   PLATFORMS="macosx_11_0_arm64" ./scripts/make-bundle.sh
-#   # 多平台示例:PLATFORMS="macosx_11_0_arm64 manylinux_2_28_x86_64"
+#   # 多平台示例:PLATFORMS="macosx_11_0_arm64 manylinux_2_28_x86_64 win_amd64"
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

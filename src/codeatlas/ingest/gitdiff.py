@@ -29,12 +29,17 @@ class ChangeSet:
 
 
 def _git(repo_path: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", str(repo_path), "-c", "core.quotepath=false", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    """跑 git;输出按 UTF-8 解码(core.quotepath=false 时路径就是 UTF-8,
+    Windows 默认按系统代码页解码会把中文路径弄乱)。git 不在 PATH 时返回失败结果,
+    调用方据此退回 scan 模式。"""
+    cmd = ["git", "-C", str(repo_path), "-c", "core.quotepath=false", *args]
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            check=False,
+        )
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", "git: command not found")
 
 
 def _head(repo_path: Path) -> str | None:

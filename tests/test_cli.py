@@ -256,7 +256,6 @@ def _answer(text):
 def test_agent_session_ctrl_c_interrupts_only_current_question(monkeypatch):
     """思考中 Ctrl-C:只中断本问,会话继续(asyncio 下 SIGINT 表现为 CancelledError)。"""
     import asyncio
-    import os
     import signal
 
     calls = {"n": 0}
@@ -264,7 +263,7 @@ def test_agent_session_ctrl_c_interrupts_only_current_question(monkeypatch):
     async def fake_run(question, *a, **k):
         calls["n"] += 1
         if calls["n"] == 1:
-            os.kill(os.getpid(), signal.SIGINT)
+            signal.raise_signal(signal.SIGINT)  # 跨平台;Windows 上 os.kill(SIGINT) 会直接结束进程
             await asyncio.sleep(5)
         return _answer(f"答:{question}")
 

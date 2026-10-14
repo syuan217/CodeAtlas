@@ -691,7 +691,7 @@ async def index_docs(conn, lance, embedder, docs_dir, settings) -> int:
         for ch in chunk_markdown(text, settings.chunk_max_tokens):
             cid = insert_text_chunk(
                 conn, repo_id=repo_id, kind="doc",
-                title=f"docs:{page.relative_to(docs_dir)}:{ch.title or ''}", chunk=ch,
+                title=f"docs:{page.relative_to(docs_dir).as_posix()}:{ch.title or ''}", chunk=ch,
             )
             pending.append((cid, ch.content))
     conn.commit()
